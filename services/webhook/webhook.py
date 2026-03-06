@@ -42,6 +42,7 @@ def getenv_clean(name: str, default=None):
 NOTION_TOKEN = getenv_clean("NOTION_TOKEN")
 NOTION_EVENT_INTERNAL_DB_ID = getenv_clean("NOTION_EVENT_INTERNAL_ID")
 NOTION_EVENT_EXTERNAL_DB_ID = getenv_clean("NOTION_EVENT_ID")
+NOTION_QA_DB_ID = getenv_clean("NOTION_QA_ID")
 
 GOOGLE_CALENDAR_ID = getenv_clean("GOOGLE_CALENDAR_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = getenv_clean("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -49,6 +50,10 @@ GOOGLE_SERVICE_ACCOUNT_JSON_PATH = getenv_clean("GOOGLE_SERVICE_ACCOUNT_JSON_PAT
 
 DISCORD_TOKEN = getenv_clean("DISCORD_TOKEN")
 DISCORD_GUILD_ID = getenv_clean("DISCORD_GUILD_ID")
+QA_CHANNEL_ID = int(getenv_clean("QA_CHANNEL_ID", "0") or 0)
+REMINDER_CHANNEL_ID = int(getenv_clean("REMINDER_CHANNEL_ID", "0") or 0)
+REMINDER_ROLE_ID = int(getenv_clean("REMINDER_ROLE_ID", "0") or 0)
+REMINDER_WINDOW_MINUTES = int(getenv_clean("REMINDER_WINDOW_MINUTES", "15") or 15)
 DISCORD_SYNC_ENABLED = getenv_clean("DISCORD_SYNC_ENABLED", "true").lower() in (
     "1",
     "true",
@@ -56,14 +61,22 @@ DISCORD_SYNC_ENABLED = getenv_clean("DISCORD_SYNC_ENABLED", "true").lower() in (
     "on",
 )
 
-SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
 STATE_DIR = getenv_clean("STATE_DIR", ".")
 SYNC_STATE_FILE = os.path.join(STATE_DIR, "gcal_sync_state.json")
 DEDUPE_STATE_FILE = os.path.join(STATE_DIR, "gcal_recent_messages.json")
 GCAL_DISCORD_MAP_FILE = os.path.join(STATE_DIR, "gcal_discord_map.json")
 GCAL_NOTION_MAP_FILE = os.path.join(STATE_DIR, "gcal_notion_map.json")
+DISCORD_POLL_STATE_FILE = os.path.join(STATE_DIR, "discord_events_snapshot.json")
+QA_CACHE_FILE = os.path.join(STATE_DIR, "qa_cache.json")
+REMINDER_CACHE_FILE = os.path.join(STATE_DIR, "reminder_cache.json")
 DEDUPE_MAX_IDS = int(getenv_clean("DEDUPE_MAX_IDS", "1000"))
-SYNC_COOLDOWN_SECONDS = float(getenv_clean("SYNC_COOLDOWN_SECONDS", "2"))
+SYNC_INTERVAL_SECONDS = float(
+    getenv_clean(
+        "SYNC_INTERVAL_SECONDS",
+        getenv_clean("SYNC_COOLDOWN_SECONDS", "300"),
+    )
+)
 
 NOTION_PROP_TITLE = getenv_clean("NOTION_PROP_TITLE", "イベント名")
 NOTION_PROP_CONTENT = getenv_clean("NOTION_PROP_CONTENT", "内容")
@@ -257,6 +270,83 @@ def save_gcal_notion_map():
             json.dump(_gcal_notion_map, f, ensure_ascii=False, indent=2)
     except Exception as exc:
         logger.warning("Failed to save gcal_notion_map: %s", exc)
+
+
+def load_discord_snapshot():
+    # Discordイベント差分ポーリング用の前回スナップショットを読み込む。
+    if not os.path.exists(DISCORD_POLL_STATE_FILE):
+        return {}
+    try:
+        with open(DISCORD_POLL_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items() if k}
+    except Exception as exc:
+        logger.warning("Failed to load discord snapshot: %s", exc)
+        return {}
+
+
+def save_discord_snapshot(snapshot):
+    # Discordイベント差分ポーリング用のスナップショットを保存する。
+    ensure_state_dir()
+    try:
+        with open(DISCORD_POLL_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(snapshot or {}, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        logger.warning("Failed to save discord snapshot: %s", exc)
+
+
+def load_json_file(path, default_value):
+    if not os.path.exists(path):
+        return default_value
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data
+    except Exception:
+        return default_value
+
+
+def save_json_file(path, data):
+    ensure_state_dir()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def discord_send_message(channel_id, content, allowed_mentions=None):
+    if not DISCORD_TOKEN or not channel_id or not content:
+        return False
+    payload = {"content": content}
+    if allowed_mentions is not None:
+        payload["allowed_mentions"] = allowed_mentions
+    res = discord_api_request("POST", f"/channels/{channel_id}/messages", payload=payload)
+    return res is not None
+
+
+def notion_query_all_pages(db_id):
+    # Notion DB の全ページをページング取得する。
+    if not db_id:
+        return []
+    url = f"https://api.notion.com/v1/databases/{db_id}/query"
+    pages = []
+    cursor = None
+    while True:
+        body = {}
+        if cursor:
+            body["start_cursor"] = cursor
+        res = requests.post(url, headers=headers, json=body, timeout=30)
+        if res.status_code != 200:
+            logger.error("Notion query all pages failed db=%s body=%s", db_id, res.text)
+            return pages
+        data = res.json() or {}
+        pages.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+        if not cursor:
+            break
+    return pages
 
 
 def get_notion_page_id_by_google_id(google_event_id, scope):
@@ -538,6 +628,100 @@ def build_notion_date(event):
     return date_prop
 
 
+def build_notion_date_from_datetimes(start_dt, end_dt):
+    # datetime から Notion date プロパティ形式を作成する。
+    if not start_dt:
+        return None
+    if end_dt and end_dt <= start_dt:
+        end_dt = start_dt + timedelta(hours=1)
+    date_prop = {"start": start_dt.astimezone(timezone.utc).isoformat()}
+    if end_dt:
+        date_prop["end"] = end_dt.astimezone(timezone.utc).isoformat()
+    return date_prop
+
+
+def to_google_datetime(dt):
+    # Google Calendar API 用の RFC3339 文字列へ変換する。
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone(timedelta(hours=9))).isoformat()
+
+
+def google_add_event(name, description, start_dt, end_dt, location=None):
+    # Google Calendar へイベントを追加する。
+    service = get_calendar_service()
+    if not service:
+        return None
+    start_iso = to_google_datetime(start_dt)
+    end_iso = to_google_datetime(end_dt)
+    if not start_iso:
+        return None
+    if not end_iso:
+        end_iso = to_google_datetime(start_dt + timedelta(hours=1))
+    body = {
+        "summary": name,
+        "description": description,
+        "start": {"dateTime": start_iso, "timeZone": "Asia/Tokyo"},
+        "end": {"dateTime": end_iso, "timeZone": "Asia/Tokyo"},
+    }
+    if location:
+        body["location"] = str(location)
+    try:
+        return service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=body).execute()
+    except Exception as exc:
+        logger.error("Google create failed: %s", exc)
+        return None
+
+
+def google_update_event(google_event_id, name, description, start_dt, end_dt, location=None):
+    # Google Calendar のイベントを更新する。
+    if not google_event_id:
+        return None
+    service = get_calendar_service()
+    if not service:
+        return None
+    start_iso = to_google_datetime(start_dt)
+    end_iso = to_google_datetime(end_dt)
+    if not start_iso:
+        return None
+    if not end_iso:
+        end_iso = to_google_datetime(start_dt + timedelta(hours=1))
+    body = {
+        "summary": name,
+        "description": description,
+        "start": {"dateTime": start_iso, "timeZone": "Asia/Tokyo"},
+        "end": {"dateTime": end_iso, "timeZone": "Asia/Tokyo"},
+    }
+    if location:
+        body["location"] = str(location)
+    try:
+        return (
+            service.events()
+            .patch(calendarId=GOOGLE_CALENDAR_ID, eventId=google_event_id, body=body)
+            .execute()
+        )
+    except Exception as exc:
+        logger.error("Google update failed event_id=%s err=%s", google_event_id, exc)
+        return None
+
+
+def google_delete_event(google_event_id):
+    # Google Calendar のイベントを削除する。
+    if not google_event_id:
+        return False
+    service = get_calendar_service()
+    if not service:
+        return False
+    try:
+        service.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=google_event_id).execute()
+        return True
+    except Exception as exc:
+        logger.error("Google delete failed event_id=%s err=%s", google_event_id, exc)
+        return False
+
+
 def notion_extract_rich_text(page, prop_name):
     # ------------------------------------------------------------
     # Notionの rich_text プロパティ先頭テキストを抽出する。
@@ -566,6 +750,100 @@ def notion_extract_rich_text(page, prop_name):
         text = str(content).strip()
         return text or None
     return None
+
+
+def notion_extract_title(page, prop_name):
+    if not page:
+        return None
+    props = page.get("properties", {})
+    title_nodes = props.get(prop_name, {}).get("title", [])
+    if not title_nodes:
+        return None
+    node = title_nodes[0]
+    text = node.get("plain_text") or node.get("text", {}).get("content")
+    if not text:
+        return None
+    text = str(text).strip()
+    return text or None
+
+
+def notion_extract_number(page, prop_name):
+    if not page:
+        return None
+    return page.get("properties", {}).get(prop_name, {}).get("number")
+
+
+def ensure_qa_question_numbers():
+    # QA DBで質問番号が未設定のページに連番を付与する。
+    if not NOTION_QA_DB_ID:
+        return
+    pages = notion_query_all_pages(NOTION_QA_DB_ID)
+    existing_numbers = []
+    missing_pages = []
+    for page in pages:
+        n = notion_extract_number(page, "質問番号")
+        if n is None:
+            missing_pages.append(page)
+            continue
+        try:
+            existing_numbers.append(int(n))
+        except Exception:
+            pass
+    next_num = (max(existing_numbers) + 1) if existing_numbers else 1
+    missing_pages.sort(key=lambda p: str(p.get("created_time") or ""))
+    for page in missing_pages:
+        res = requests.patch(
+            f"https://api.notion.com/v1/pages/{page['id']}",
+            headers=headers,
+            json={"properties": {"質問番号": {"number": next_num}}},
+            timeout=30,
+        )
+        if res.status_code not in (200, 201):
+            logger.warning("Failed to assign QA question number page=%s body=%s", page["id"], res.text)
+            continue
+        next_num += 1
+
+
+def run_qa_notification_job():
+    # QA DBの新規/更新を検知して未回答だけDiscordへ通知する。
+    if not NOTION_QA_DB_ID or not QA_CHANNEL_ID:
+        return True
+    ensure_qa_question_numbers()
+    pages = notion_query_all_pages(NOTION_QA_DB_ID)
+    cache = load_json_file(QA_CACHE_FILE, {})
+    if not isinstance(cache, dict):
+        cache = {}
+    first_run = bool(cache.get("_first_qa_run", True))
+    new_cache = {"_first_qa_run": False}
+    had_error = False
+
+    for page in pages:
+        page_id = page.get("id")
+        if not page_id:
+            continue
+        last = str(page.get("last_edited_time") or "")
+        new_cache[page_id] = last
+        if first_run:
+            continue
+        if cache.get(page_id) == last:
+            continue
+        question = notion_extract_title(page, "質問") or "(質問なし)"
+        answer = notion_extract_rich_text(page, "回答") or "(回答なし)"
+        if answer != "(回答なし)":
+            continue
+        q_number = notion_extract_number(page, "質問番号")
+        number_display = q_number if q_number is not None else "?"
+        msg = (
+            f"質問(#{number_display}) に更新があります\n"
+            f"質問: {question}\n"
+            f"回答: {answer}"
+        )
+        sent = discord_send_message(QA_CHANNEL_ID, msg)
+        if not sent:
+            had_error = True
+            logger.error("QA notification failed page=%s", page_id)
+    save_json_file(QA_CACHE_FILE, new_cache)
+    return not had_error
 
 
 def notion_find_by_google_event_id(google_event_id, db_id=None):
@@ -825,6 +1103,319 @@ def discord_api_request(method, path, payload=None):
         return res.json()
     except Exception:
         return {}
+
+
+def discord_event_url(discord_event_id):
+    if not DISCORD_GUILD_ID or not discord_event_id:
+        return None
+    return f"https://discord.com/events/{DISCORD_GUILD_ID}/{discord_event_id}"
+
+
+def parse_discord_event_times(discord_event):
+    # Discordイベントの開始/終了時刻を datetime に変換する。
+    start_dt = parse_rfc3339(discord_event.get("scheduled_start_time"))
+    end_dt = parse_rfc3339(discord_event.get("scheduled_end_time"))
+    if not start_dt:
+        return None, None
+    if not end_dt or end_dt <= start_dt:
+        end_dt = start_dt + timedelta(hours=1)
+    return start_dt, end_dt
+
+
+def get_discord_event_location(discord_event):
+    metadata = discord_event.get("entity_metadata") or {}
+    location = metadata.get("location")
+    if not location:
+        return None
+    text = str(location).strip()
+    return text or None
+
+
+def normalize_discord_event(discord_event):
+    # 差分比較用に Discordイベントを正規化する。
+    event_id = str(discord_event.get("id") or "")
+    if not event_id:
+        return None
+    normalized = {
+        "id": event_id,
+        "name": str(discord_event.get("name") or ""),
+        "description": str(discord_event.get("description") or ""),
+        "scheduled_start_time": str(discord_event.get("scheduled_start_time") or ""),
+        "scheduled_end_time": str(discord_event.get("scheduled_end_time") or ""),
+        "location": str(get_discord_event_location(discord_event) or ""),
+        "status": str(discord_event.get("status") or ""),
+    }
+    return normalized
+
+
+def discord_event_fingerprint(discord_event):
+    # 差分判定用のフィンガープリント文字列を作成する。
+    normalized = normalize_discord_event(discord_event)
+    if not normalized:
+        return None
+    return json.dumps(normalized, sort_keys=True, ensure_ascii=False)
+
+
+def list_discord_scheduled_events():
+    # Discord Scheduled Events 一覧を取得する。
+    if not discord_sync_available():
+        return []
+    result = discord_api_request(
+        "GET",
+        f"/guilds/{DISCORD_GUILD_ID}/scheduled-events?with_user_count=false",
+    )
+    if not isinstance(result, list):
+        return []
+    return result
+
+
+def run_day_before_reminder_job():
+    # Discordイベント一覧から「24時間後の窓」に入るイベントを通知する。
+    if not REMINDER_CHANNEL_ID or not REMINDER_ROLE_ID:
+        return True
+    events = list_discord_scheduled_events()
+    now_utc = datetime.now(timezone.utc)
+    window_start = now_utc + timedelta(hours=24)
+    window_end = window_start + timedelta(minutes=max(1, REMINDER_WINDOW_MINUTES))
+
+    cache = load_json_file(REMINDER_CACHE_FILE, {})
+    if not isinstance(cache, dict):
+        cache = {}
+    cache_changed = False
+    had_error = False
+
+    for event in events:
+        event_id = str(event.get("id") or "")
+        if not event_id:
+            continue
+        start_dt = parse_rfc3339(event.get("scheduled_start_time"))
+        if not start_dt:
+            continue
+        if not (window_start <= start_dt < window_end):
+            continue
+        if event_id in cache:
+            continue
+        event_url = discord_event_url(event_id) or ""
+        msg = (
+            f"<@&{REMINDER_ROLE_ID}> 明日開催のイベントがあります\n"
+            f"{event_url}"
+        )
+        sent = discord_send_message(
+            REMINDER_CHANNEL_ID,
+            msg,
+            allowed_mentions={"parse": ["roles"], "users": [], "everyone": False},
+        )
+        if sent:
+            cache[event_id] = now_utc.isoformat()
+            cache_changed = True
+        else:
+            had_error = True
+            logger.error("Reminder send failed event_id=%s", event_id)
+
+    if cache_changed:
+        save_json_file(REMINDER_CACHE_FILE, cache)
+    return not had_error
+
+
+def find_internal_notion_page_by_discord_id(discord_event_id):
+    return notion_find_by_message_id(discord_event_id, NOTION_EVENT_INTERNAL_DB_ID)
+
+
+def find_external_notion_page_by_discord_id(discord_event_id):
+    if not NOTION_EVENT_EXTERNAL_DB_ID:
+        return None
+    return notion_find_by_message_id(discord_event_id, NOTION_EVENT_EXTERNAL_DB_ID)
+
+
+def sync_discord_event_create_or_update(discord_event):
+    # Discordイベント1件を Google/Notion へ upsert する。
+    event_id = str(discord_event.get("id") or "")
+    if not event_id:
+        return True
+    name = str(discord_event.get("name") or "(no title)")
+    description = str(discord_event.get("description") or "(no content)")
+    creator_id = str(discord_event.get("creator_id") or "unknown")
+    event_url = discord_event_url(event_id)
+    location = get_discord_event_location(discord_event)
+    start_dt, end_dt = parse_discord_event_times(discord_event)
+    if not start_dt:
+        logger.warning("Discord event skipped (invalid time) id=%s", event_id)
+        return True
+    date_prop = build_notion_date_from_datetimes(start_dt, end_dt)
+    if not date_prop:
+        return True
+
+    internal_page = find_internal_notion_page_by_discord_id(event_id)
+    external_page = find_external_notion_page_by_discord_id(event_id)
+    google_event_id = notion_extract_rich_text(internal_page, NOTION_PROP_GOOGLE_EVENT_ID)
+
+    if google_event_id:
+        updated = google_update_event(
+            google_event_id=google_event_id,
+            name=name,
+            description=description,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            location=location,
+        )
+        if not updated:
+            return False
+    else:
+        created = google_add_event(
+            name=name,
+            description=description,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            location=location,
+        )
+        if not created or not created.get("id"):
+            return False
+        google_event_id = str(created["id"])
+        set_discord_event_id_by_google_id(google_event_id, event_id)
+
+    if internal_page:
+        ok = notion_update_event(
+            internal_page["id"],
+            name=name,
+            content=description,
+            date_prop=date_prop,
+            event_url=event_url,
+            google_event_id=google_event_id,
+            message_id=event_id,
+            location=location,
+        )
+        if not ok:
+            return False
+        set_notion_page_id_by_google_id(google_event_id, internal_page["id"], "internal")
+    else:
+        new_page_id = notion_create_event(
+            name=name,
+            content=description,
+            date_prop=date_prop,
+            creator_id=creator_id,
+            event_url=event_url,
+            google_event_id=google_event_id,
+            location=location,
+            db_id=NOTION_EVENT_INTERNAL_DB_ID,
+            message_id=event_id,
+        )
+        if not new_page_id:
+            return False
+        set_notion_page_id_by_google_id(google_event_id, new_page_id, "internal")
+
+    if NOTION_EVENT_EXTERNAL_DB_ID:
+        if external_page:
+            ext_ok = notion_update_event(
+                external_page["id"],
+                name=name,
+                content=description,
+                date_prop=date_prop,
+                message_id=event_id,
+                google_event_id=google_event_id,
+            )
+            if not ext_ok:
+                return False
+            set_notion_page_id_by_google_id(google_event_id, external_page["id"], "external")
+        else:
+            ext_page_id = notion_create_event(
+                name=name,
+                content=description,
+                date_prop=date_prop,
+                creator_id=creator_id,
+                event_url=None,
+                google_event_id=google_event_id,
+                location=None,
+                db_id=NOTION_EVENT_EXTERNAL_DB_ID,
+                message_id=event_id,
+            )
+            if not ext_page_id:
+                return False
+            set_notion_page_id_by_google_id(google_event_id, ext_page_id, "external")
+    return True
+
+
+def sync_discord_event_delete(discord_event):
+    # Discordで削除されたイベントを Google/Notion へ反映する。
+    event_id = str(discord_event.get("id") or "")
+    if not event_id:
+        return True
+    internal_page = find_internal_notion_page_by_discord_id(event_id)
+    external_page = find_external_notion_page_by_discord_id(event_id)
+    google_event_id = notion_extract_rich_text(internal_page, NOTION_PROP_GOOGLE_EVENT_ID)
+
+    if google_event_id and not google_delete_event(google_event_id):
+        return False
+
+    if internal_page and not notion_archive_page(internal_page):
+        return False
+    if external_page and not notion_archive_page(external_page):
+        return False
+
+    if google_event_id:
+        remove_discord_event_id_by_google_id(google_event_id)
+        remove_notion_page_id_by_google_id(google_event_id, "internal")
+        remove_notion_page_id_by_google_id(google_event_id, "external")
+    return True
+
+
+def sync_discord_poll():
+    # Discordイベント差分を5分ポーリングで Google/Notion に反映する。
+    if not discord_sync_available():
+        return True
+    events = list_discord_scheduled_events()
+    current_snapshot = {}
+    current_events = {}
+    for event in events:
+        normalized = normalize_discord_event(event)
+        if not normalized:
+            continue
+        event_id = normalized["id"]
+        current_events[event_id] = event
+        current_snapshot[event_id] = discord_event_fingerprint(event)
+
+    previous_snapshot = load_discord_snapshot()
+    had_error = False
+
+    created_ids = [eid for eid in current_snapshot.keys() if eid not in previous_snapshot]
+    deleted_ids = [eid for eid in previous_snapshot.keys() if eid not in current_snapshot]
+    updated_ids = [
+        eid
+        for eid in current_snapshot.keys()
+        if eid in previous_snapshot and current_snapshot[eid] != previous_snapshot[eid]
+    ]
+
+    for event_id in created_ids + updated_ids:
+        event = current_events.get(event_id)
+        if not event:
+            continue
+        try:
+            ok = sync_discord_event_create_or_update(event)
+            if not ok:
+                had_error = True
+                logger.error("Discord poll upsert failed event_id=%s", event_id)
+        except Exception as exc:
+            had_error = True
+            logger.exception("Discord poll upsert exception event_id=%s err=%s", event_id, exc)
+
+    for event_id in deleted_ids:
+        try:
+            ok = sync_discord_event_delete({"id": event_id})
+            if not ok:
+                had_error = True
+                logger.error("Discord poll delete failed event_id=%s", event_id)
+        except Exception as exc:
+            had_error = True
+            logger.exception("Discord poll delete exception event_id=%s err=%s", event_id, exc)
+
+    save_discord_snapshot(current_snapshot)
+    logger.info(
+        "Discord poll completed created=%d updated=%d deleted=%d had_error=%s",
+        len(created_ids),
+        len(updated_ids),
+        len(deleted_ids),
+        had_error,
+    )
+    return not had_error
 
 
 def parse_google_event_times(event):
@@ -1277,6 +1868,13 @@ def sync_calendar():
     return not had_error
 
 
+def sync_all():
+    # Google差分同期 + Discord差分同期をまとめて実行する。
+    gcal_ok = sync_calendar()
+    discord_ok = sync_discord_poll()
+    return gcal_ok and discord_ok
+
+
 def run_sync_guarded(source: str):
     # ------------------------------------------------------------
     # 同期処理の同時実行を抑止し、短時間の連打通知を間引く。
@@ -1293,11 +1891,11 @@ def run_sync_guarded(source: str):
     global _sync_last_run_epoch
 
     now = time.time()
-    if now - _sync_last_run_epoch < max(0.0, SYNC_COOLDOWN_SECONDS):
+    if now - _sync_last_run_epoch < max(0.0, SYNC_INTERVAL_SECONDS):
         logger.info(
-            "Sync skipped source=%s reason=cooldown cool=%.3fs",
+            "Sync skipped source=%s reason=cooldown interval=%.3fs",
             source,
-            SYNC_COOLDOWN_SECONDS,
+            SYNC_INTERVAL_SECONDS,
         )
         return True, "cooldown"
 
@@ -1307,7 +1905,7 @@ def run_sync_guarded(source: str):
         return True, "in_progress"
 
     try:
-        synced = sync_calendar()
+        synced = sync_all()
         _sync_last_run_epoch = time.time()
         return synced, "done"
     finally:
@@ -1353,6 +1951,7 @@ def gcal_webhook():
 
 
 @app.route("/gcal/sync", methods=["GET", "POST"])
+@app.route("/sync/all", methods=["GET", "POST"])
 def manual_sync():
     # ------------------------------------------------------------
     # 手動同期エンドポイント。
@@ -1365,6 +1964,27 @@ def manual_sync():
     return ("ok", 200) if synced else ("sync failed", 500)
 
 
+@app.route("/jobs/qa-check", methods=["GET", "POST"])
+def qa_check_job():
+    ok = run_qa_notification_job()
+    return ("ok", 200) if ok else ("qa check failed", 500)
+
+
+@app.route("/jobs/reminder", methods=["GET", "POST"])
+def reminder_job():
+    ok = run_day_before_reminder_job()
+    return ("ok", 200) if ok else ("reminder failed", 500)
+
+
+@app.route("/jobs/run-all", methods=["GET", "POST"])
+def run_all_jobs():
+    sync_ok, _ = run_sync_guarded("jobs")
+    qa_ok = run_qa_notification_job()
+    reminder_ok = run_day_before_reminder_job()
+    ok = sync_ok and qa_ok and reminder_ok
+    return ("ok", 200) if ok else ("jobs failed", 500)
+
+
 @app.route("/health", methods=["GET"])
 def health():
     # ヘルスチェック用エンドポイント。
@@ -1374,5 +1994,3 @@ def health():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
-
-

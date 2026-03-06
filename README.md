@@ -4,33 +4,25 @@ Discord と Google Calendar / Notion を同期する Bot です。
 
 ## Workflow
 
-### 1) Discord -> Google Calendar / Notion
-
-- `services/bot/bot.py` が Discord Scheduled Event を監視
-- イベント作成時:
-  - Google Calendar にイベント作成
-  - Notion 外部DB / 内部DB に登録
-- イベント更新時:
-  - Notion 外部DB / 内部DB を更新
-  - 内部DBに保存済みの GoogleイベントID があれば Google Calendar も更新
-- イベント削除時:
-  - Notion 外部DB / 内部DB をアーカイブ
-  - 内部DBに保存済みの GoogleイベントID があれば Google Calendar も削除
-
-### 2) Google Calendar -> Discord / Notion (webhook-only)
+### 1) Google Calendar -> Discord / Notion
 
 - `services/watcher/register.py` / `services/watcher/renew.py` が Google Calendar watch を管理
   - 通知先は `GCAL_WEBHOOK_URL`（`https://<webhook-domain>/gcal/webhook`）
-- Notion:
-  - `services/webhook/webhook.py` が通知受信後に Google Calendar の差分を取得して Notion に反映
-- Discord:
-  - `services/webhook/webhook.py` が通知受信後に Google Calendar の差分を取得して Discord に反映
+- `services/webhook/webhook.py` が通知受信後に Google Calendar の差分を取得して反映
+  - Notion 内部DB / 外部DB
+  - Discord Scheduled Events
+
+### 2) Discord -> Google Calendar / Notion (HTTP + 差分ポーリング)
+
+- `services/webhook/webhook.py` が Discord Scheduled Events 一覧を定期取得
+- 前回スナップショットとの差分で `create/update/delete` を判定
+- 差分を Google Calendar / Notion に反映
 
 ## Services
 
-- `services/bot`: Discord Bot 本体
+- `services/bot`: 旧Gateway運用。`ENABLE_REALTIME_SYNC=false` ならイベント同期は無効
 - `services/watcher`: Google Calendar watch 登録 / 更新
-- `services/webhook`: Google Calendar 通知受信 + Notion / Discord 反映
+- `services/webhook`: 同期本体（Google通知受信 + 5分差分同期 + 通知ジョブ）
 
 ## Auto Archive
 
@@ -39,34 +31,18 @@ Discord と Google Calendar / Notion を同期する Bot です。
 
 ## Command Features
 
-### Discord Slash Commands
+### HTTP Endpoints
 
-- `/q_answer`
-  - 未回答の質問を選んで回答を投稿
-  - 投稿先チャンネルは `QA_CHANNEL_ID`
-- `/q_edit`
-  - 既存回答を選んで編集
-  - 投稿先チャンネルは `QA_CHANNEL_ID`
-
-### Bot Event Sync
-
-- Discord イベント作成:
-  - Google Calendar 作成
-  - Notion 外部DB / 内部DB 作成
-- Discord イベント更新:
-  - Notion 外部DB / 内部DB 更新
-  - 必要に応じて Google Calendar 更新
-- Discord イベント削除:
-  - Notion 外部DB / 内部DB アーカイブ
-
-### Scheduled Tasks
-
-- `auto_clean`:
-  - 古いイベントを Notion からアーカイブ
-- `auto_check_qa`:
+- `POST /sync/all`:
+  - Google差分同期 + Discord差分同期を実行
+- `GET/POST /gcal/sync`:
+  - `POST /sync/all` と同等（互換）
+- `POST /jobs/qa-check`:
   - Q&A DB の差分確認と未回答通知
-- `auto_day_before_reminder`:
+- `POST /jobs/reminder`:
   - 前日リマインド送信
+- `POST /jobs/run-all`:
+  - 同期 + QA + リマインドを一括実行
 
 ## Operation
 
@@ -74,12 +50,155 @@ Discord と Google Calendar / Notion を同期する Bot です。
 2. `services/watcher` の `GCAL_WEBHOOK_URL` に webhook URL を設定
 3. `services/watcher/register.py` を実行して watch 初回登録
 4. 定期的に `services/watcher/renew.py` を実行して watch 更新
+5. Cloud Scheduler などで以下を定期実行
+   - `POST https://<webhook-domain>/sync/all` を 5分間隔
+   - `POST https://<webhook-domain>/jobs/qa-check` を 5-10分間隔
+   - `POST https://<webhook-domain>/jobs/reminder` を 5分間隔
+
+## Cloud Scheduler Runbook
+
+### 推奨ジョブ構成（最小）
+
+1. `sync-all`:
+   - URL: `POST /sync/all`
+   - Cron: `*/5 * * * *`
+2. `qa-check`:
+   - URL: `POST /jobs/qa-check`
+   - Cron: `*/10 * * * *`（通知遅延を抑えるなら `*/5`）
+3. `reminder`:
+   - URL: `POST /jobs/reminder`
+   - Cron: `*/5 * * * *`
+
+### 必須環境変数（webhook）
+
+- `NOTION_TOKEN`
+- `NOTION_EVENT_INTERNAL_ID`
+- `NOTION_EVENT_ID`（外部DBを使う場合）
+- `GOOGLE_CALENDAR_ID`
+- `GOOGLE_SERVICE_ACCOUNT_JSON` または `GOOGLE_SERVICE_ACCOUNT_JSON_PATH`
+- `DISCORD_TOKEN`
+- `DISCORD_GUILD_ID`
+- `STATE_DIR`（永続ボリュームを推奨）
+- `SYNC_INTERVAL_SECONDS=300`
+
+### 通知ジョブ用の追加環境変数
+
+- `NOTION_QA_ID`
+- `QA_CHANNEL_ID`
+- `REMINDER_CHANNEL_ID`
+- `REMINDER_ROLE_ID`
+- `REMINDER_WINDOW_MINUTES`（既定15）
+
+### GCP コマンド例（Cloud Run + Cloud Scheduler）
+
+以下は `bash` 前提の例。
+
+```bash
+# 0) 変数設定
+PROJECT_ID="<your-project-id>"
+REGION="asia-northeast1"
+SERVICE_NAME="ie-event-webhook"
+IMAGE="gcr.io/${PROJECT_ID}/${SERVICE_NAME}:latest"
+
+WEBHOOK_URL="https://${SERVICE_NAME}-<hash>-an.a.run.app"
+SCHEDULER_SA="scheduler-invoker@${PROJECT_ID}.iam.gserviceaccount.com"
+```
+
+```bash
+# 1) API有効化
+gcloud services enable run.googleapis.com cloudscheduler.googleapis.com iam.googleapis.com \
+  --project "${PROJECT_ID}"
+```
+
+```bash
+# 2) Scheduler実行用SA作成
+gcloud iam service-accounts create scheduler-invoker \
+  --project "${PROJECT_ID}" \
+  --display-name "Scheduler Invoker"
+```
+
+```bash
+# 3) Cloud Run デプロイ（環境変数は必要に応じて追加）
+gcloud run deploy "${SERVICE_NAME}" \
+  --project "${PROJECT_ID}" \
+  --region "${REGION}" \
+  --image "${IMAGE}" \
+  --platform managed \
+  --allow-unauthenticated \
+  --set-env-vars SYNC_INTERVAL_SECONDS=300
+```
+
+```bash
+# 4) Scheduler SA に Cloud Run Invoker 権限付与
+gcloud run services add-iam-policy-binding "${SERVICE_NAME}" \
+  --project "${PROJECT_ID}" \
+  --region "${REGION}" \
+  --member "serviceAccount:${SCHEDULER_SA}" \
+  --role "roles/run.invoker"
+```
+
+```bash
+# 5) 5分同期ジョブ
+gcloud scheduler jobs create http sync-all \
+  --project "${PROJECT_ID}" \
+  --location "${REGION}" \
+  --schedule "*/5 * * * *" \
+  --time-zone "Asia/Tokyo" \
+  --uri "${WEBHOOK_URL}/sync/all" \
+  --http-method POST \
+  --oidc-service-account-email "${SCHEDULER_SA}" \
+  --oidc-token-audience "${WEBHOOK_URL}"
+```
+
+```bash
+# 6) QA通知ジョブ（10分）
+gcloud scheduler jobs create http qa-check \
+  --project "${PROJECT_ID}" \
+  --location "${REGION}" \
+  --schedule "*/10 * * * *" \
+  --time-zone "Asia/Tokyo" \
+  --uri "${WEBHOOK_URL}/jobs/qa-check" \
+  --http-method POST \
+  --oidc-service-account-email "${SCHEDULER_SA}" \
+  --oidc-token-audience "${WEBHOOK_URL}"
+```
+
+```bash
+# 7) 前日リマインドジョブ（5分）
+gcloud scheduler jobs create http reminder \
+  --project "${PROJECT_ID}" \
+  --location "${REGION}" \
+  --schedule "*/5 * * * *" \
+  --time-zone "Asia/Tokyo" \
+  --uri "${WEBHOOK_URL}/jobs/reminder" \
+  --http-method POST \
+  --oidc-service-account-email "${SCHEDULER_SA}" \
+  --oidc-token-audience "${WEBHOOK_URL}"
+```
+
+```bash
+# 8) 手動実行テスト
+gcloud scheduler jobs run sync-all --project "${PROJECT_ID}" --location "${REGION}"
+gcloud scheduler jobs run qa-check --project "${PROJECT_ID}" --location "${REGION}"
+gcloud scheduler jobs run reminder --project "${PROJECT_ID}" --location "${REGION}"
+```
+
+```bash
+# 9) ログ確認
+gcloud run services logs read "${SERVICE_NAME}" \
+  --project "${PROJECT_ID}" \
+  --region "${REGION}" \
+  --limit 200
+```
 
 ## Health Check
 
 - `GET /health` -> `ok`
-- `GET /gcal/sync` -> 手動同期
-- `POST /gcal/sync` -> 手動同期
+- `GET/POST /gcal/sync` -> 手動同期（互換）
+- `POST /sync/all` -> 手動同期（推奨）
+- `POST /jobs/qa-check` -> QA通知ジョブ
+- `POST /jobs/reminder` -> 前日リマインドジョブ
+- `POST /jobs/run-all` -> 同期+通知一括ジョブ
 
 ## Troubleshooting
 
@@ -88,20 +207,20 @@ Discord と Google Calendar / Notion を同期する Bot です。
 - `services/webhook` ログに `/gcal/webhook` アクセスが出るか確認
 - まず疎通確認:
   - `curl -i https://<webhook-domain>/health`
-  - `curl -i https://<webhook-domain>/gcal/sync`
+  - `curl -i -X POST https://<webhook-domain>/sync/all`
 
 ### 2) 手動同期で切り分ける
 
-- `GET /gcal/sync` が成功して Notion / Discordが更新される場合:
+- `POST /sync/all` が成功して Notion / Discordが更新される場合:
   - Notion API / Google API / 認証は概ね正常
-  - 問題は「通知経路（watch -> webhook）」に絞れる
+  - 問題は「watch通知」「Scheduler」「入力データ」に絞れる
 
 ### 3) `updatedMinTooLongAgo` (HTTP 410) が出る場合
 
 - ログに `updatedMinTooLongAgo` が出たら古い同期状態
 - 状態ファイルをリセットして再同期
 
-### 4) Notion / Disocrd に反映されない場合
+### 4) Notion / Discord に反映されない場合
 
 - `services/webhook` ログで以下を確認:
   - `Google events fetched: N`
@@ -150,11 +269,10 @@ Notion DB を誤って直接編集した場合は、次の順で復旧する。
 ### Re-sync and Verification
 
 1. 手動同期を実行:
-   - `GET /gcal/sync`
+   - `POST /sync/all`
    - または `POST /gcal/sync`
 2. `services/webhook` ログで以下を確認:
    - `Google events fetched: N`
    - `Sync completed`
-3. `services/bot` ログで以下を確認:
-   - Google更新/削除スキップ警告が増えていないこと
-
+3. `services/webhook` ログで以下を確認:
+   - Discord poll / Google sync でエラーが増えていないこと
