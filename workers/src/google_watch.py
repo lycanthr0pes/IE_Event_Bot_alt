@@ -1,9 +1,15 @@
 import json
 from datetime import datetime, timezone
+from typing import Any, TYPE_CHECKING
 from urllib.parse import quote
 from uuid import uuid4
 
 from google_auth import get_google_access_token
+
+if TYPE_CHECKING:
+    # Cloudflare Python Workers provides `fetch` as a runtime global.
+    # Declare it for static analyzers (Pylance) only.
+    fetch: Any
 
 
 def _env_text(env, key: str, default: str = "") -> str:
