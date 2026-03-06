@@ -1,0 +1,49 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ie-event-bot-workers",
+  "main": "src/entry.py",
+  "compatibility_date": "2026-03-07",
+  "compatibility_flags": ["python_workers"],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SYNC_COORDINATOR",
+        "class_name": "SyncCoordinator"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1-sync-coordinator",
+      "new_sqlite_classes": ["SyncCoordinator"]
+    }
+  ],
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "SYNC_INTERVAL_SECONDS": "300",
+    "KV_SYNC_COOLDOWN_ENABLED": "true",
+    "KV_GCAL_DEDUPE_ENABLED": "true",
+    "WORKER_SYNC_ALL_MODE": "native",
+    "WORKER_HYBRID_INCLUDE_DISCORD_NOTION": "true",
+    "WORKER_HYBRID_APPLY_GOOGLE_EVENTS": "false",
+    "SYNC_DO_LOCK_ENABLED": "true",
+    "SYNC_DO_LOCK_TTL_SECONDS": "120",
+    "CRON_ENABLE_SYNC": "true",
+    "CRON_ENABLE_DISCORD_NOTION_SYNC": "false",
+    "CRON_ENABLE_GCAL_WATCH_RENEW": "false",
+    "CRON_ENABLE_GCAL_WATCH_ENSURE": "true",
+    "GCAL_WATCH_RENEW_THRESHOLD_SECONDS": "86400",
+    "CRON_ENABLE_QA": "true",
+    "CRON_ENABLE_REMINDER": "true",
+    "CRON_ENABLE_AUTO_CLEAN": "true",
+    "CLEANUP_INTERVAL_SECONDS": "86400",
+    "DISCORD_TO_GOOGLE_SYNC_ENABLED": "true"
+  },
+  "triggers": {
+    "crons": [
+      "*/5 * * * *"
+    ]
+  }
+}
