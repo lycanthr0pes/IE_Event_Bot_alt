@@ -2,13 +2,33 @@ import json
 import time
 import base64
 from uuid import uuid4
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    fetch: Any
+
+"""
+Google API アクセストークン解決モジュール。
+
+解決優先順:
+1) 直接 env (`GOOGLE_API_BEARER_TOKEN`)
+2) KV キャッシュ (`google:access_token`)
+3) 外部トークンブローカー
+4) Service Account JWT assertion
+"""
 
 
 def _b64url(data: bytes) -> str:
+    """
+    JWT 用 Base64URL エンコード（パディングなし）。
+    """
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
 
 def _env_text(env, key: str, default: str = "") -> str:
+    """
+    Worker env から文字列を安全に取得する。
+    """
     value = getattr(env, key, None)
     if value is None:
         return default
@@ -17,6 +37,10 @@ def _env_text(env, key: str, default: str = "") -> str:
 
 
 async def _get_cached_token(state):
+    """
+    KV からキャッシュ済みGoogleアクセストークンを取得する。
+    - `expires_at - 60秒` を有効期限として扱い、失効直前の利用を避ける。
+    """
     if not state.enabled():
         return None
     token = await state.get_text("google:access_token")
@@ -27,19 +51,23 @@ async def _get_cached_token(state):
         expires_at = float(expires_at_raw or "0")
     except Exception:
         expires_at = 0.0
-    # refresh 60s before expiry
+    # 期限の60秒前までなら使う
     if expires_at > 0 and time.time() < (expires_at - 60):
         return token
     return None
 
 
 async def _get_cached_token_meta(state):
+    """
+    キャッシュトークンの存在・有効性メタ情報(健康度)を返す。
+    可観測データとして利用する。
+    """
     if not state.enabled():
         return {
-            "present": False,
-            "valid": False,
-            "expires_at": None,
-            "ttl_seconds": None,
+            "present": False, # 存在
+            "valid": False, # 有効性
+            "expires_at": None, # 期限
+            "ttl_seconds": None, # 残り秒数
         }
     token = await state.get_text("google:access_token")
     expires_at_raw = await state.get_text("google:expires_at")
@@ -66,6 +94,9 @@ async def _get_cached_token_meta(state):
 
 
 async def _save_cached_token(state, token: str, expires_at: float | None):
+    """
+    token と任意の有効期限(epoch)を KV に保存する。
+    """
     if not state.enabled():
         return
     await state.put_text("google:access_token", token)
@@ -74,15 +105,22 @@ async def _save_cached_token(state, token: str, expires_at: float | None):
 
 
 async def _fetch_token_from_broker(env, state):
+    """
+    外部トークンブローカーからトークンを取得する。
+    - `access_token` (必須)
+    - `expires_at` または `expires_in` (任意)
+    """
     broker_url = _env_text(env, "GOOGLE_TOKEN_BROKER_URL", "")
     if not broker_url:
         return None
 
+    # トークン取得用の認証情報を作成
     broker_auth = _env_text(env, "GOOGLE_TOKEN_BROKER_AUTH", "")
     headers = {"Content-Type": "application/json"}
     if broker_auth:
         headers["Authorization"] = f"Bearer {broker_auth}"
 
+    # トークン取得リクエスト
     response = await fetch(
         broker_url,
         {
@@ -91,6 +129,7 @@ async def _fetch_token_from_broker(env, state):
             "body": json.dumps({"scope": "https://www.googleapis.com/auth/calendar"}),
         },
     )
+    # 読み取り
     if int(response.status) >= 400:
         return None
     text = await response.text()
@@ -98,7 +137,8 @@ async def _fetch_token_from_broker(env, state):
         data = json.loads(text or "{}")
     except Exception:
         return None
-
+    
+    # Google API アクセストークン取得
     access_token = str(data.get("access_token") or "").strip()
     if not access_token:
         return None
@@ -120,6 +160,11 @@ async def _fetch_token_from_broker(env, state):
 
 
 def _load_service_account_info_from_env(env):
+    """
+    Service Account JSON を env から読み込む。
+    - `GOOGLE_SERVICE_ACCOUNT_JSON` (生JSON)
+    - `GOOGLE_SERVICE_ACCOUNT_JSON_B64` (base64)
+    """
     raw = _env_text(env, "GOOGLE_SERVICE_ACCOUNT_JSON", "")
     if raw:
         try:
@@ -137,7 +182,12 @@ def _load_service_account_info_from_env(env):
 
 
 def _sign_rs256(message: bytes, private_key_pem: str):
-    # Try cryptography first (supports PKCS8 PRIVATE KEY commonly used by Google SA)
+    """
+    RS256 署名を行う。
+    - `cryptography` 優先（PKCS8 対応）
+    - 失敗時 `rsa` パッケージへフォールバック（PKCS1 対応）
+    """
+    # cryptography
     try:
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import padding
@@ -149,7 +199,7 @@ def _sign_rs256(message: bytes, private_key_pem: str):
     except Exception:
         pass
 
-    # Fallback to rsa package (works with RSA PRIVATE KEY / PKCS1)
+    # RSA
     try:
         import rsa
 
@@ -160,6 +210,9 @@ def _sign_rs256(message: bytes, private_key_pem: str):
 
 
 def _build_service_account_assertion(sa_info: dict, scope: str):
+    """
+    OAuth JWT Bearer 用 JWT を生成する。
+    """
     private_key = str(sa_info.get("private_key") or "").strip()
     client_email = str(sa_info.get("client_email") or "").strip()
     private_key_id = str(sa_info.get("private_key_id") or "").strip()
@@ -188,6 +241,10 @@ def _build_service_account_assertion(sa_info: dict, scope: str):
 
 
 async def _fetch_token_from_service_account(env, state):
+    """
+    JWT アサーションを使ってGoogle の OAuth トークンエンドポイントから
+    アクセストークンを取得する。
+    """
     sa_info = _load_service_account_info_from_env(env)
     if not sa_info:
         return None
@@ -202,6 +259,7 @@ async def _fetch_token_from_service_account(env, state):
         "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer"
         f"&assertion={assertion}"
     )
+    # Google OAuth リクエスト
     response = await fetch(
         "https://oauth2.googleapis.com/token",
         {
@@ -210,6 +268,7 @@ async def _fetch_token_from_service_account(env, state):
             "body": body,
         },
     )
+    # 読み取り
     if int(response.status) >= 400:
         return None
     text = await response.text()
@@ -217,6 +276,7 @@ async def _fetch_token_from_service_account(env, state):
         data = json.loads(text or "{}")
     except Exception:
         return None
+    # Google API アクセストークン取得
     access_token = str(data.get("access_token") or "").strip()
     if not access_token:
         return None
@@ -233,10 +293,11 @@ async def _fetch_token_from_service_account(env, state):
 
 async def get_google_access_token(env, state):
     """
-    Resolve Google access token in this order:
-    1) GOOGLE_API_BEARER_TOKEN (direct)
-    2) KV cache (google:access_token / google:expires_at)
-    3) GOOGLE_TOKEN_BROKER_URL (fetch and cache)
+    Google API アクセストークン取得試行の順番:
+    1) GOOGLE_API_BEARER_TOKEN (直接)
+    2) KVキャッシュ(google:access_token / google:expires_at)
+    3) GOOGLE_TOKEN_BROKER_URL
+    4) サービスアカウントJWTアサーション
     """
     direct = _env_text(env, "GOOGLE_API_BEARER_TOKEN", "")
     if direct:
@@ -256,6 +317,10 @@ async def get_google_access_token(env, state):
 
 
 async def describe_google_auth_sources(env, state):
+    """
+    現在利用可能な認証ソース状態を返す。
+    運用時の診断（/admin/migration-status）で使用する。
+    """
     direct = _env_text(env, "GOOGLE_API_BEARER_TOKEN", "")
     broker = _env_text(env, "GOOGLE_TOKEN_BROKER_URL", "")
     cache_meta = await _get_cached_token_meta(state)
@@ -268,11 +333,15 @@ async def describe_google_auth_sources(env, state):
 
 
 async def set_google_access_token(state, access_token: str, expires_in_seconds: int | None):
+    """
+    管理API経由で受け取ったトークンを KV キャッシュに保存する。
+    """
     if not access_token:
         return False
     expires_at = None
     if expires_in_seconds is not None:
         try:
+            # Unix Timeで比較するために絶対時刻にする
             expires_at = time.time() + max(1, int(expires_in_seconds))
         except Exception:
             expires_at = None

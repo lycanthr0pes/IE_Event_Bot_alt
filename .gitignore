@@ -1,20 +1,38 @@
-﻿# Python cache
+# Python cache
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyd
+*.so
 
 # Virtual environments
 .venv/
 venv/
 env/
 services/watcher/.venv/
+.python-version
 
 # Test / tooling caches
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.pyre/
+.cache/
+.hypothesis/
+.tox/
+.nox/
 .coverage
+.coverage.*
 htmlcov/
+coverage.xml
+pytest-cache-files-*/
+
+# Local temp/work dirs
+.tmp/
+tmp/
+temp/
+*.tmp
+*.log
 
 # OS / editor
 .DS_Store
@@ -26,3 +44,18 @@ Thumbs.db
 build/
 dist/
 *.egg-info/
+pip-wheel-metadata/
+
+# Local generated artifacts
+artifacts/
+
+# Environment files
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Cloudflare Workers / Wrangler
+.wrangler/
+.dev.vars
+.dev.vars.*

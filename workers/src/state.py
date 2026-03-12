@@ -4,22 +4,34 @@ from datetime import datetime, timezone
 
 
 def _bool_env(value: str | None, default: bool = False) -> bool:
+    """環境変数文字列を bool として解釈する。"""
     if value is None:
         return default
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 class StateStore:
+    """
+    Workers KV 上の状態アクセスを集約する。
+    - 同期カーソル/最終実行時刻の保持
+    - Google webhook 重複通知の抑止
+    - gcal<->discord/notion マッピング保持
+    - ジョブ結果の保存
+    """
+
     def __init__(self, env):
         self.env = env
 
     def enabled(self) -> bool:
+        """STATE_KV バインディングの有無を返す。"""
         return getattr(self.env, "STATE_KV", None) is not None
 
     def _kv(self):
+        """内部ヘルパー: KV バインディングを返す。"""
         return getattr(self.env, "STATE_KV", None)
 
     async def get_text(self, key: str) -> str | None:
+        """KV から文字列を取得し、空文字は None として扱う。"""
         kv = self._kv()
         if kv is None:
             return None
@@ -30,12 +42,14 @@ class StateStore:
         return text or None
 
     async def put_text(self, key: str, value: str):
+        """KV へ文字列を書き込む。"""
         kv = self._kv()
         if kv is None:
             return
         await kv.put(key, str(value))
 
     async def get_json(self, key: str, default=None):
+        """KV の JSON 文字列を辞書等へ復元する。失敗時は default。"""
         text = await self.get_text(key)
         if not text:
             return default
@@ -45,6 +59,7 @@ class StateStore:
             return default
 
     async def put_json(self, key: str, payload):
+        """Python オブジェクトを JSON 化して KV へ保存する。"""
         await self.put_text(
             key,
             json.dumps(payload, ensure_ascii=False),
@@ -52,11 +67,15 @@ class StateStore:
 
     async def mark_google_message_seen(self, channel_id: str, message_number: str) -> bool:
         """
-        Returns True when the message was already seen, otherwise marks and returns False.
+        Google webhook 重複通知抑止用。
+        返り値:
+            True: 既に処理済み
+            False: 未処理だったので今回マークした
         """
         if not channel_id or not message_number:
             return False
         key = f"gcal_msg:{channel_id}:{message_number}"
+        # 存在確認
         existing = await self.get_text(key)
         if existing is not None:
             return True
@@ -64,13 +83,16 @@ class StateStore:
         return False
 
     async def get_sync_updated_min(self) -> str | None:
+        """Google差分同期カーソル(updatedMin)を取得する。"""
         return await self.get_text("sync:updated_min")
 
     async def set_sync_updated_min(self, updated_min: str):
+        """Google差分同期カーソル(updatedMin)を保存する。"""
         if updated_min:
             await self.put_text("sync:updated_min", str(updated_min))
 
     async def get_sync_last_epoch(self) -> float:
+        """最後に同期成功した時刻(epoch秒)を取得する。"""
         text = await self.get_text("sync:last_epoch")
         if not text:
             return 0.0
@@ -80,9 +102,11 @@ class StateStore:
             return 0.0
 
     async def set_sync_last_epoch_now(self):
+        """最後の同期時刻を現在時刻で更新する。"""
         await self.put_text("sync:last_epoch", str(time.time()))
 
     async def should_skip_sync_by_cooldown(self, interval_seconds: float) -> bool:
+        """クールダウン判定。直近実行から interval 未満なら True。"""
         if interval_seconds <= 0:
             return False
         now = time.time()
@@ -90,13 +114,16 @@ class StateStore:
         return (now - last_epoch) < interval_seconds
 
     async def get_gcal_discord_map(self) -> dict:
+        """GoogleイベントID -> DiscordイベントID の対応表を取得する。"""
         value = await self.get_json("map:gcal_discord", {})
         return value if isinstance(value, dict) else {}
 
     async def set_gcal_discord_map(self, data: dict):
+        """GoogleイベントID -> DiscordイベントID の対応表を保存する。"""
         await self.put_json("map:gcal_discord", data or {})
 
     async def get_gcal_notion_map(self) -> dict:
+        """GoogleイベントID -> NotionページID の対応表を取得する。"""
         value = await self.get_json("map:gcal_notion", {"internal": {}, "external": {}})
         if not isinstance(value, dict):
             return {"internal": {}, "external": {}}
@@ -105,19 +132,23 @@ class StateStore:
         return value
 
     async def set_gcal_notion_map(self, data: dict):
+        """GoogleイベントID -> NotionページID の対応表を保存する。"""
         payload = data if isinstance(data, dict) else {"internal": {}, "external": {}}
         payload.setdefault("internal", {})
         payload.setdefault("external", {})
         await self.put_json("map:gcal_notion", payload)
 
     async def get_discord_snapshot(self) -> dict:
+        """Discordポーリング差分検知用スナップショットを取得する。"""
         value = await self.get_json("discord:snapshot", {})
         return value if isinstance(value, dict) else {}
 
     async def set_discord_snapshot(self, data: dict):
+        """Discordポーリング差分検知用スナップショットを保存する。"""
         await self.put_json("discord:snapshot", data or {})
 
     async def set_last_result(self, op_name: str, payload: dict):
+        """ジョブ/同期結果を `result:<op_name>` に保存する。"""
         if not op_name:
             return
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -128,6 +159,7 @@ class StateStore:
         await self.put_json(f"result:{op_name}", data)
 
     async def get_last_result(self, op_name: str):
+        """`result:<op_name>` の最新結果を取得する。"""
         if not op_name:
             return None
         value = await self.get_json(f"result:{op_name}", None)
@@ -135,8 +167,10 @@ class StateStore:
 
     @staticmethod
     def is_kv_sync_cooldown_enabled(env) -> bool:
+        """同期クールダウン機能の有効/無効を返す。"""
         return _bool_env(getattr(env, "KV_SYNC_COOLDOWN_ENABLED", "true"), default=True)
 
     @staticmethod
     def is_gcal_dedupe_enabled(env) -> bool:
+        """Google webhook 重複抑止機能の有効/無効を返す。"""
         return _bool_env(getattr(env, "KV_GCAL_DEDUPE_ENABLED", "true"), default=True)

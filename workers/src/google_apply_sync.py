@@ -1,9 +1,23 @@
 import json
 from datetime import datetime, timedelta, timezone
+from typing import Any, TYPE_CHECKING
 from urllib.parse import quote
+
+if TYPE_CHECKING:
+    fetch: Any
+
+"""
+Google Calendar 差分イベントを Notion / Discord へ適用するモジュール。
+
+責務:
+- GoogleイベントIDを主キーに internal/external Notion DB を upsert
+- cancel イベントは Notion アーカイブ + Discord 削除
+- gcal<->notion / gcal<->discord の対応マップを KV に保持
+"""
 
 
 def _env_text(env, key: str, default: str = "") -> str:
+    """Worker env から文字列設定を取得する。"""
     value = getattr(env, key, None)
     if value is None:
         return default
@@ -12,6 +26,7 @@ def _env_text(env, key: str, default: str = "") -> str:
 
 
 def _env_bool(env, key: str, default: bool) -> bool:
+    """Worker env の bool 設定を取得する。"""
     value = getattr(env, key, None)
     if value is None:
         return default
@@ -19,10 +34,12 @@ def _env_bool(env, key: str, default: bool) -> bool:
 
 
 def _prop(env, key: str, default: str) -> str:
+    """Notion プロパティ名の env 上書きを解決する。"""
     return _env_text(env, key, default)
 
 
 def _notion_headers(env) -> dict:
+    """Notion API 共通ヘッダを返す。"""
     token = _env_text(env, "NOTION_TOKEN", "")
     return {
         "Authorization": f"Bearer {token}",
@@ -32,6 +49,7 @@ def _notion_headers(env) -> dict:
 
 
 def _parse_rfc3339(value: str | None):
+    """RFC3339 文字列を datetime へ変換する。失敗時は None。"""
     if not value:
         return None
     try:
@@ -41,6 +59,7 @@ def _parse_rfc3339(value: str | None):
 
 
 def _to_discord_iso(dt):
+    """Discord API 向けの UTC ISO8601(Z) へ変換する。"""
     if dt is None:
         return None
     if dt.tzinfo is None:
@@ -49,17 +68,28 @@ def _to_discord_iso(dt):
 
 
 def _parse_google_event_times(event: dict):
+    """
+    Googleイベントの開始/終了時刻を datetime として返す。
+    - dateTime と date(日付のみ)の両方を扱う
+    - end が欠ける/不正な場合は +1h で補完
+    """
+
     def parse_part(part: dict, is_end: bool = False):
         date_time = part.get("dateTime")
         date_only = part.get("date")
+        # 変換
         if date_time:
             dt = _parse_rfc3339(date_time)
             if dt:
                 return dt
         if date_only:
             try:
-                d = datetime.strptime(date_only, "%Y-%m-%d")
-                base = d.replace(tzinfo=timezone(timedelta(hours=9)))
+                d = datetime.strptime(date_only, "%Y-%m-%d") # datetime変換
+                base = d.replace(tzinfo=timezone(timedelta(hours=9))) # JST(UTC+9)を付ける
+                """
+                開始なら9時間足す -> 09:00 JST
+                終了なら1時間足す -> 01:00 JST
+                """
                 return base + (timedelta(hours=1) if is_end else timedelta(hours=9))
             except Exception:
                 return None
@@ -69,12 +99,14 @@ def _parse_google_event_times(event: dict):
     end_dt = parse_part((event or {}).get("end") or {}, is_end=True)
     if not start_dt:
         return None, None
+    # 終了が開始以下なら1時間イベントとして補完
     if not end_dt or end_dt <= start_dt:
         end_dt = start_dt + timedelta(hours=1)
     return start_dt, end_dt
 
 
 def _build_notion_date(event: dict):
+    """Google の start/end を Notion date 形式へ変換する。"""
     start = (event or {}).get("start") or {}
     end = (event or {}).get("end") or {}
     start_iso = start.get("dateTime") or start.get("date")
@@ -88,6 +120,7 @@ def _build_notion_date(event: dict):
 
 
 def _notion_extract_rich_text(page: dict, prop_name: str):
+    """Notion rich_text の先頭要素を文字列化して返す。"""
     props = (page or {}).get("properties", {}) or {}
     rich = ((props.get(prop_name) or {}).get("rich_text") or [])
     if not rich:
@@ -105,19 +138,17 @@ def _notion_extract_rich_text(page: dict, prop_name: str):
 
 
 async def _notion_query_by_google_event_id(env, db_id: str, google_event_id: str):
+    """GoogleイベントID一致で Notion ページを1件検索する。"""
     if not db_id or not google_event_id:
         return None
-    prop_google_id = _prop(
-        env,
-        "NOTION_PROP_GOOGLE_EVENT_ID",
-        "Google\u30a4\u30d9\u30f3\u30c8ID",
-    )
+    prop_google_id = _prop(env, "NOTION_PROP_GOOGLE_EVENT_ID", "GoogleイベントID")
     body = {
         "filter": {
             "property": prop_google_id,
             "rich_text": {"equals": str(google_event_id)},
         }
     }
+    # Notion API リクエスト
     response = await fetch(
         f"https://api.notion.com/v1/databases/{db_id}/query",
         {
@@ -126,6 +157,7 @@ async def _notion_query_by_google_event_id(env, db_id: str, google_event_id: str
             "body": json.dumps(body, ensure_ascii=False),
         },
     )
+    # 読み取り
     if int(response.status) != 200:
         return None
     data = json.loads(await response.text() or "{}")
@@ -134,15 +166,17 @@ async def _notion_query_by_google_event_id(env, db_id: str, google_event_id: str
 
 
 async def _notion_query_by_message_id(env, db_id: str, message_id: str):
+    """message_id一致で Notion ページを1件検索する（外部DB互換用途）。"""
     if not db_id or not message_id:
         return None
-    prop_message_id = _prop(env, "NOTION_PROP_MESSAGE_ID", "\u30e1\u30c3\u30bb\u30fc\u30b8ID")
+    prop_message_id = _prop(env, "NOTION_PROP_MESSAGE_ID", "メッセージID")
     body = {
         "filter": {
             "property": prop_message_id,
             "rich_text": {"equals": str(message_id)},
         }
     }
+    # Notion API リクエスト
     response = await fetch(
         f"https://api.notion.com/v1/databases/{db_id}/query",
         {
@@ -151,6 +185,7 @@ async def _notion_query_by_message_id(env, db_id: str, message_id: str):
             "body": json.dumps(body, ensure_ascii=False),
         },
     )
+    # 読み取り
     if int(response.status) != 200:
         return None
     data = json.loads(await response.text() or "{}")
@@ -159,12 +194,15 @@ async def _notion_query_by_message_id(env, db_id: str, message_id: str):
 
 
 async def _notion_get_page(env, page_id: str):
+    """Notion page_id からページを直接取得する。"""
     if not page_id:
         return None
+    # Notion API リクエスト
     response = await fetch(
         f"https://api.notion.com/v1/pages/{page_id}",
         {"method": "GET", "headers": _notion_headers(env)},
     )
+    # 読み取り
     if int(response.status) != 200:
         return None
     data = json.loads(await response.text() or "{}")
@@ -184,20 +222,23 @@ async def _notion_update_event(
     message_id=None,
     location=None,
 ):
+    """
+    Notion イベントページを部分更新する。
+
+    設計:
+    - None の引数は更新対象から除外
+    - プロパティ名は NOTION_PROP_* で上書き可能
+    """
     if not page_id:
         return False
-    prop_title = _prop(env, "NOTION_PROP_TITLE", "\u30a4\u30d9\u30f3\u30c8\u540d")
-    prop_content = _prop(env, "NOTION_PROP_CONTENT", "\u5185\u5bb9")
-    prop_date = _prop(env, "NOTION_PROP_DATE", "\u65e5\u6642")
-    prop_message_id = _prop(env, "NOTION_PROP_MESSAGE_ID", "\u30e1\u30c3\u30bb\u30fc\u30b8ID")
-    prop_page_id = _prop(env, "NOTION_PROP_PAGE_ID", "\u30da\u30fc\u30b8ID")
-    prop_event_url = _prop(env, "NOTION_PROP_EVENT_URL", "\u30a4\u30d9\u30f3\u30c8URL")
-    prop_google_id = _prop(
-        env,
-        "NOTION_PROP_GOOGLE_EVENT_ID",
-        "Google\u30a4\u30d9\u30f3\u30c8ID",
-    )
-    prop_location = _prop(env, "NOTION_PROP_LOCATION", "\u5834\u6240")
+    prop_title = _prop(env, "NOTION_PROP_TITLE", "イベント名")
+    prop_content = _prop(env, "NOTION_PROP_CONTENT", "内容")
+    prop_date = _prop(env, "NOTION_PROP_DATE", "日時")
+    prop_message_id = _prop(env, "NOTION_PROP_MESSAGE_ID", "メッセージID")
+    prop_page_id = _prop(env, "NOTION_PROP_PAGE_ID", "ページID")
+    prop_event_url = _prop(env, "NOTION_PROP_EVENT_URL", "イベントURL")
+    prop_google_id = _prop(env, "NOTION_PROP_GOOGLE_EVENT_ID", "GoogleイベントID")
+    prop_location = _prop(env, "NOTION_PROP_LOCATION", "場所")
 
     props = {}
     if name is not None:
@@ -217,6 +258,7 @@ async def _notion_update_event(
     if location is not None:
         props[prop_location] = {"rich_text": [{"text": {"content": str(location)}}]}
 
+    # Notion API リクエスト
     response = await fetch(
         f"https://api.notion.com/v1/pages/{page_id}",
         {
@@ -241,21 +283,21 @@ async def _notion_create_event(
     message_id,
     location=None,
 ):
+    """
+    Notion イベントページを新規作成する。
+    作成後に page_uuid を自ページIDで更新する。
+    """
     if not db_id:
         return None
-    prop_title = _prop(env, "NOTION_PROP_TITLE", "\u30a4\u30d9\u30f3\u30c8\u540d")
-    prop_content = _prop(env, "NOTION_PROP_CONTENT", "\u5185\u5bb9")
-    prop_date = _prop(env, "NOTION_PROP_DATE", "\u65e5\u6642")
-    prop_message_id = _prop(env, "NOTION_PROP_MESSAGE_ID", "\u30e1\u30c3\u30bb\u30fc\u30b8ID")
-    prop_creator_id = _prop(env, "NOTION_PROP_CREATOR_ID", "\u4f5c\u6210\u8005ID")
-    prop_page_id = _prop(env, "NOTION_PROP_PAGE_ID", "\u30da\u30fc\u30b8ID")
-    prop_event_url = _prop(env, "NOTION_PROP_EVENT_URL", "\u30a4\u30d9\u30f3\u30c8URL")
-    prop_google_id = _prop(
-        env,
-        "NOTION_PROP_GOOGLE_EVENT_ID",
-        "Google\u30a4\u30d9\u30f3\u30c8ID",
-    )
-    prop_location = _prop(env, "NOTION_PROP_LOCATION", "\u5834\u6240")
+    prop_title = _prop(env, "NOTION_PROP_TITLE", "イベント名")
+    prop_content = _prop(env, "NOTION_PROP_CONTENT", "内容")
+    prop_date = _prop(env, "NOTION_PROP_DATE", "日時")
+    prop_message_id = _prop(env, "NOTION_PROP_MESSAGE_ID", "メッセージID")
+    prop_creator_id = _prop(env, "NOTION_PROP_CREATOR_ID", "作成者ID")
+    prop_page_id = _prop(env, "NOTION_PROP_PAGE_ID", "ページID")
+    prop_event_url = _prop(env, "NOTION_PROP_EVENT_URL", "イベントURL")
+    prop_google_id = _prop(env, "NOTION_PROP_GOOGLE_EVENT_ID", "GoogleイベントID")
+    prop_location = _prop(env, "NOTION_PROP_LOCATION", "場所")
 
     props = {
         prop_title: {"title": [{"text": {"content": str(name)}}]},
@@ -272,6 +314,7 @@ async def _notion_create_event(
     if location is not None:
         props[prop_location] = {"rich_text": [{"text": {"content": str(location)}}]}
 
+    # Notion API リクエスト
     response = await fetch(
         "https://api.notion.com/v1/pages",
         {
@@ -283,6 +326,7 @@ async def _notion_create_event(
             ),
         },
     )
+    # 読み取り
     if int(response.status) not in (200, 201):
         return None
     data = json.loads(await response.text() or "{}")
@@ -294,9 +338,11 @@ async def _notion_create_event(
 
 
 async def _notion_archive_page(env, page: dict):
+    """Notion ページを archived=true に更新(削除)する。"""
     page_id = (page or {}).get("id")
     if not page_id:
         return False
+    # Notion API リクエスト
     response = await fetch(
         f"https://api.notion.com/v1/pages/{page_id}",
         {
@@ -309,9 +355,11 @@ async def _notion_archive_page(env, page: dict):
 
 
 async def _discord_api_request(env, method: str, path: str, payload=None):
+    """Discord REST API 共通ラッパー。失敗時は None。"""
     token = _env_text(env, "DISCORD_TOKEN", "")
     if not token:
         return None
+    # Dicord REST API リクエスト
     response = await fetch(
         f"https://discord.com/api/v10{path}",
         {
@@ -323,6 +371,7 @@ async def _discord_api_request(env, method: str, path: str, payload=None):
             "body": None if payload is None else json.dumps(payload, ensure_ascii=False),
         },
     )
+    # 読み取り
     if int(response.status) >= 400:
         return None
     text = await response.text()
@@ -335,6 +384,7 @@ async def _discord_api_request(env, method: str, path: str, payload=None):
 
 
 def _discord_sync_available(env):
+    """Discord 反映に必要な設定が揃っているか判定する。"""
     if not _env_bool(env, "DISCORD_SYNC_ENABLED", True):
         return False
     if not _env_text(env, "DISCORD_TOKEN", ""):
@@ -345,10 +395,15 @@ def _discord_sync_available(env):
 
 
 def _build_discord_description(env, description: str | None, google_event_id: str):
+    """
+    Discord説明文を組み立てる。
+    - 必要なら Googleカレンダー用の識別マーカーを末尾に付ける
+    - 長すぎる場合は文字数制限で切る
+    """
     base = str(description or "").strip()
     append_marker = _env_bool(env, "DISCORD_APPEND_GCAL_MARKER", False)
     marker_prefix = _env_text(env, "DISCORD_ORIGIN_MARKER_PREFIX", "[gcal-id:")
-    limit_raw = _env_text(env, "DISCORD_DESCRIPTION_LIMIT", "1000")
+    limit_raw = _env_text(env, "DISCORD_DESCRIPTION_LIMIT", "1000") # 最大文字数
     try:
         limit = int(limit_raw)
     except Exception:
@@ -362,6 +417,7 @@ def _build_discord_description(env, description: str | None, google_event_id: st
 
 
 def _build_discord_payload(env, event: dict):
+    """Google イベントを Discord イベント payload へ変換する。"""
     google_event_id = str((event or {}).get("id") or "")
     if not google_event_id:
         return None
@@ -370,10 +426,11 @@ def _build_discord_payload(env, event: dict):
         return None
     limit_name = int(_env_text(env, "DISCORD_NAME_LIMIT", "100") or "100")
     limit_loc = int(_env_text(env, "DISCORD_LOCATION_LIMIT", "100") or "100")
+    # Googleイベントに location が無い場合に使う代替文字列
     fallback_loc = _env_text(env, "DISCORD_LOCATION_FALLBACK", "Google Calendar")
     location = str((event or {}).get("location") or fallback_loc).strip()
     return {
-        "name": str((event or {}).get("summary") or "(no title)")[: max(1, limit_name)],
+        "name": str((event or {}).get("summary") or "(タイトルなし)")[: max(1, limit_name)],
         "description": _build_discord_description(
             env,
             (event or {}).get("description"),
@@ -388,10 +445,12 @@ def _build_discord_payload(env, event: dict):
 
 
 async def _discord_create_event(env, event: dict):
+    """Discord イベントを新規作成する。"""
     guild_id = _env_text(env, "DISCORD_GUILD_ID", "")
     payload = _build_discord_payload(env, event)
     if not guild_id or not payload:
         return None
+    # Dicord REST API リクエスト
     return await _discord_api_request(
         env,
         "POST",
@@ -401,10 +460,12 @@ async def _discord_create_event(env, event: dict):
 
 
 async def _discord_update_event(env, discord_event_id: str, event: dict):
+    """Discord イベントを更新する。"""
     guild_id = _env_text(env, "DISCORD_GUILD_ID", "")
     payload = _build_discord_payload(env, event)
     if not guild_id or not discord_event_id or not payload:
         return None
+    # Dicord REST API リクエスト
     return await _discord_api_request(
         env,
         "PATCH",
@@ -414,9 +475,11 @@ async def _discord_update_event(env, discord_event_id: str, event: dict):
 
 
 async def _discord_delete_event(env, discord_event_id: str):
+    """Discord イベントを削除する。"""
     guild_id = _env_text(env, "DISCORD_GUILD_ID", "")
     if not guild_id or not discord_event_id:
         return False
+    # Dicord REST API リクエスト
     result = await _discord_api_request(
         env,
         "DELETE",
@@ -426,24 +489,37 @@ async def _discord_delete_event(env, discord_event_id: str):
 
 
 async def _sync_to_discord(env, event: dict, notion_page: dict, fallback_page: dict, gcal_discord_map: dict):
+    """
+    Googleイベントを Discord 側へ同期し、DiscordイベントIDを返す。
+    Discord ID(message_id / mapped_id) 探索順:
+    1) notion_page.message_id
+    2) fallback_page.message_id
+    3) KVマップ(gcal_discord_map)
+    """
     if not _discord_sync_available(env):
         return None
     google_event_id = str((event or {}).get("id") or "")
     if not google_event_id:
         return None
-    prop_message_id = _prop(env, "NOTION_PROP_MESSAGE_ID", "\u30e1\u30c3\u30bb\u30fc\u30b8ID")
+    prop_message_id = _prop(env, "NOTION_PROP_MESSAGE_ID", "メッセージID")
+    # notion_page から message_id を読む
     notion_discord_id = _notion_extract_rich_text(notion_page, prop_message_id)
+    # もし取れなければ fallback_page から読む
     if not notion_discord_id:
         notion_discord_id = _notion_extract_rich_text(fallback_page, prop_message_id)
+    # Google イベントIDをキーにして、対応する Discord イベントID を gcal_discord_map から取得
     mapped_id = str(gcal_discord_map.get(google_event_id) or "")
+    # 無ければ None
     discord_event_id = notion_discord_id or mapped_id or None
 
+    # 同期時にGoogle側で削除されていたらDiscord側も削除
     if (event or {}).get("status") == "cancelled":
         if discord_event_id:
             await _discord_delete_event(env, discord_event_id)
         gcal_discord_map.pop(google_event_id, None)
         return None
-
+    
+    # discord_event_idがNoneでなければDiscord側更新
     if discord_event_id:
         updated = await _discord_update_event(env, discord_event_id, event)
         if updated is not None:
@@ -451,7 +527,7 @@ async def _sync_to_discord(env, event: dict, notion_page: dict, fallback_page: d
             gcal_discord_map[google_event_id] = resolved
             return resolved
         return None
-
+    # discord_event_idがNoneならDiscord側新規作成
     created = await _discord_create_event(env, event)
     if created and (created or {}).get("id"):
         resolved = str(created["id"])
@@ -461,13 +537,22 @@ async def _sync_to_discord(env, event: dict, notion_page: dict, fallback_page: d
 
 
 async def apply_google_events(env, state, events: list[dict]):
+    """
+    Google差分イベント群を Notion/Discord へ適用する。
+    - 内部/外部DBを別々に扱い、片方失敗でも処理継続
+    - map が壊れていても DB 再検索で自己修復
+    - イベント単位で例外をハンドルし、error_count へ集約
+    """
+    """ Google -> Notion同期 """
     internal_db = _env_text(env, "NOTION_EVENT_INTERNAL_ID", "")
     external_db = _env_text(env, "NOTION_EVENT_ID", "")
     if not _env_text(env, "NOTION_TOKEN", "") or not internal_db:
         return {"ok": False, "error": "missing_notion_env", "processed": 0}
 
     if state.enabled():
+        # GoogleイベントID → DiscordイベントID の対応表
         gcal_discord_map = await state.get_gcal_discord_map()
+        # GoogleイベントID → NotionページID の対応表
         gcal_notion_map = await state.get_gcal_notion_map()
     else:
         gcal_discord_map = {}
@@ -476,6 +561,7 @@ async def apply_google_events(env, state, events: list[dict]):
     processed = 0
     had_error = False
     errors = []
+    # Notion マップの内部辞書
     internal_map = gcal_notion_map.get("internal") or {}
     external_map = gcal_notion_map.get("external") or {}
 
@@ -485,17 +571,21 @@ async def apply_google_events(env, state, events: list[dict]):
             continue
         processed += 1
         try:
+            # internal page 解決（マップ -> 直接取得 -> DB検索）
             page = None
             mapped_internal_page_id = str(internal_map.get(google_event_id) or "")
             if mapped_internal_page_id:
                 page = await _notion_get_page(env, mapped_internal_page_id)
+                # 古いマップを消す
                 if not page:
                     internal_map.pop(google_event_id, None)
             if not page:
                 page = await _notion_query_by_google_event_id(env, internal_db, google_event_id)
+                # マップ自己修復
                 if page and page.get("id"):
                     internal_map[google_event_id] = str(page["id"])
 
+            # external page 解決（マップ -> message_id検索 -> google_id検索）
             external_page = None
             if external_db:
                 mapped_external_page_id = str(external_map.get(google_event_id) or "")
@@ -506,14 +596,11 @@ async def apply_google_events(env, state, events: list[dict]):
                 if not external_page:
                     external_page = await _notion_query_by_message_id(env, external_db, google_event_id)
                     if not external_page:
-                        external_page = await _notion_query_by_google_event_id(
-                            env,
-                            external_db,
-                            google_event_id,
-                        )
+                        external_page = await _notion_query_by_google_event_id(env, external_db, google_event_id)
                     if external_page and external_page.get("id"):
                         external_map[google_event_id] = str(external_page["id"])
 
+            # Googleカレンダーから削除されたイベントをNotion側で削除
             if (event or {}).get("status") == "cancelled":
                 if page:
                     await _notion_archive_page(env, page)
@@ -524,20 +611,21 @@ async def apply_google_events(env, state, events: list[dict]):
                 await _sync_to_discord(env, event, page, external_page, gcal_discord_map)
                 continue
 
-            name = str((event or {}).get("summary") or "(no title)")
-            content = str((event or {}).get("description") or "(no content)")
+            # Notion 書き込み用の情報を準備
+            name = str((event or {}).get("summary") or "(タイトルなし)")
+            content = str((event or {}).get("description") or "(本文なし)")
             event_url = (event or {}).get("htmlLink")
             location = (event or {}).get("location")
-            creator_id = str((((event or {}).get("creator") or {}).get("email")) or "unknown")
+            creator_id = str((((event or {}).get("creator") or {}).get("email")) or "不明")
             _start_dt, end_dt = _parse_google_event_times(event)
             now_utc = datetime.now(timezone.utc)
-            skip_internal_create = (
-                page is None and end_dt is not None and end_dt.astimezone(timezone.utc) <= now_utc
-            )
+            # 内部DBページがまだ無くて、しかもそのイベントがすでに終了済みなら、新規作成しない
+            skip_internal_create = page is None and end_dt is not None and end_dt.astimezone(timezone.utc) <= now_utc
             date_prop = _build_notion_date(event)
             if not date_prop:
                 continue
 
+            # 内部用Noitonページ更新
             if page:
                 ok = await _notion_update_event(
                     env,
@@ -554,6 +642,8 @@ async def apply_google_events(env, state, events: list[dict]):
                     errors.append(f"notion_internal_update_failed:{google_event_id}")
                 else:
                     internal_map[google_event_id] = str(page["id"])
+
+            # 内部用Noitonページ作成
             elif not skip_internal_create:
                 page_id = await _notion_create_event(
                     env,
@@ -574,6 +664,7 @@ async def apply_google_events(env, state, events: list[dict]):
                 page = {"id": page_id, "properties": {}}
                 internal_map[google_event_id] = str(page_id)
 
+            # 外部用Noitonページ更新
             if external_db:
                 if external_page:
                     ext_ok = await _notion_update_event(
@@ -589,6 +680,8 @@ async def apply_google_events(env, state, events: list[dict]):
                         errors.append(f"notion_external_update_failed:{google_event_id}")
                     else:
                         external_map[google_event_id] = str(external_page["id"])
+
+                # 外部用Noitonページ作成
                 else:
                     ext_page_id = await _notion_create_event(
                         env,
@@ -609,6 +702,7 @@ async def apply_google_events(env, state, events: list[dict]):
                         external_page = {"id": ext_page_id, "properties": {}}
                         external_map[google_event_id] = str(ext_page_id)
 
+            """ Google -> Discord同期 -> Discord IDを返す """
             discord_event_id = await _sync_to_discord(
                 env,
                 event,
@@ -616,6 +710,8 @@ async def apply_google_events(env, state, events: list[dict]):
                 external_page,
                 gcal_discord_map,
             )
+
+            # Discord ID を Notion に書き戻す
             if page and discord_event_id:
                 await _notion_update_event(env, page["id"], message_id=discord_event_id)
             if external_page and discord_event_id:
@@ -624,6 +720,7 @@ async def apply_google_events(env, state, events: list[dict]):
             had_error = True
             errors.append(f"exception:{google_event_id}")
 
+    # マップ保存
     gcal_notion_map["internal"] = internal_map
     gcal_notion_map["external"] = external_map
     if state.enabled():
