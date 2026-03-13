@@ -38,6 +38,8 @@ Google API アクセストークン解決モジュール。
 4) Service Account JWT assertion
 """
 
+_last_service_account_error = None
+
 
 def _b64url(data: bytes) -> str:
     """
@@ -340,14 +342,18 @@ async def _fetch_token_from_service_account(env, state):
     JWT アサーションを使ってGoogle の OAuth トークンエンドポイントから
     アクセストークンを取得する。
     """
+    global _last_service_account_error
+    _last_service_account_error = None
     sa_info = _load_service_account_info_from_env(env)
     if not sa_info:
+        _last_service_account_error = "missing_service_account_json"
         return None
     assertion = await _build_service_account_assertion(
         sa_info,
         "https://www.googleapis.com/auth/calendar",
     )
     if not assertion:
+        _last_service_account_error = "service_account_assertion_build_failed"
         return None
 
     body = (
@@ -365,15 +371,19 @@ async def _fetch_token_from_service_account(env, state):
     )
     # 読み取り
     if int(response.status) >= 400:
+        body = await response.text()
+        _last_service_account_error = f"oauth_token_http_{int(response.status)}:{str(body or '')[:200]}"
         return None
     text = await response.text()
     try:
         data = json.loads(text or "{}")
     except Exception:
+        _last_service_account_error = "oauth_token_response_json_parse_failed"
         return None
     # Google API アクセストークン取得
     access_token = str(data.get("access_token") or "").strip()
     if not access_token:
+        _last_service_account_error = "oauth_token_missing_access_token"
         return None
     expires_in = data.get("expires_in")
     expires_at = None
@@ -383,6 +393,7 @@ async def _fetch_token_from_service_account(env, state):
         except Exception:
             expires_at = None
     await _save_cached_token(state, access_token, expires_at)
+    _last_service_account_error = None
     return access_token
 
 
@@ -423,6 +434,7 @@ async def describe_google_auth_sources(env, state):
         "direct_env": bool(direct),
         "broker_configured": bool(broker),
         "service_account_json_configured": bool(_load_service_account_info_from_env(env)),
+        "service_account_last_error": _last_service_account_error,
         "cache": cache_meta,
     }
 
