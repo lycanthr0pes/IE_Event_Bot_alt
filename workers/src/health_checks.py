@@ -4,6 +4,17 @@ from typing import Any, TYPE_CHECKING
 
 from google_auth import get_google_access_token
 
+try:
+    from workers import fetch as _runtime_fetch
+except Exception:
+    _runtime_fetch = globals().get("fetch")
+
+if _runtime_fetch is None:
+    async def fetch(*args, **kwargs):
+        raise RuntimeError("fetch_not_available")
+else:
+    fetch = _runtime_fetch
+
 if TYPE_CHECKING:
     fetch: Any
 

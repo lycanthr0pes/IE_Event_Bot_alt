@@ -3,6 +3,17 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, TYPE_CHECKING
 from urllib.parse import quote
 
+try:
+    from workers import fetch as _runtime_fetch
+except Exception:
+    _runtime_fetch = globals().get("fetch")
+
+if _runtime_fetch is None:
+    async def fetch(*args, **kwargs):
+        raise RuntimeError("fetch_not_available")
+else:
+    fetch = _runtime_fetch
+
 if TYPE_CHECKING:
     fetch: Any
 
