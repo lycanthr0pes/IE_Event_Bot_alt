@@ -44,7 +44,7 @@
 		"CLEANUP_INTERVAL_SECONDS": "86400",
 		"DISCORD_TO_GOOGLE_SYNC_ENABLED": "true",
 
-		"GCAL_WEBHOOK_URL": "",
+		"GCAL_WEBHOOK_URL": "https://lycanthr0pe.workers.dev/gcal/webhook",
 		"GOOGLE_CALENDAR_ID": "3a68d6d22b29a086c887d15d3cb6b4f3e8c1d92a501cb15a7a3b8d560a6df810@group.calendar.google.com",
 		"NOTION_EVENT_INTERNAL_ID": "2dcdf9285c70807aa54bc419d1f1d139",
 		"DISCORD_GUILD_ID": "1446782542882541649",
