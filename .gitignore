@@ -59,3 +59,4 @@ artifacts/
 .wrangler/
 .dev.vars
 .dev.vars.*
+workers/service-account.json

@@ -149,6 +149,8 @@ wrangler secret put DISCORD_TOKEN
 - `GOOGLE_SERVICE_ACCOUNT_JSON`: サービスアカウント JSON（生文字列）
 - `GOOGLE_SERVICE_ACCOUNT_JSON_B64`: サービスアカウント JSON の base64 版
 
+備考: 現時点ではサービスアカウント運用(ブローカー不使用)
+
 ### 7.3 同期・排他
 - `WORKER_SYNC_ALL_MODE` (`native` / `hybrid`): `/sync/all` の動作モード選択
 - `WORKER_HYBRID_INCLUDE_DISCORD_NOTION`: `hybrid` 時に Discord->Notion 同期を含めるか

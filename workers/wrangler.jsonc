@@ -1,48 +1,72 @@
 {
-  "name": "ie-event-bot-workers",
-  "main": "src/entry.py",
-  "compatibility_date": "2026-03-07",
-  "compatibility_flags": ["python_workers"],
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "SYNC_COORDINATOR",
-        "class_name": "SyncCoordinator"
-      }
-    ]
-  },
-  "migrations": [
-    {
-      "tag": "v1-sync-coordinator",
-      "new_sqlite_classes": ["SyncCoordinator"]
-    }
-  ],
-  "observability": {
-    "enabled": true
-  },
-  "vars": {
-    "SYNC_INTERVAL_SECONDS": "300",
-    "KV_SYNC_COOLDOWN_ENABLED": "true",
-    "KV_GCAL_DEDUPE_ENABLED": "true",
-    "WORKER_SYNC_ALL_MODE": "native",
-    "WORKER_HYBRID_INCLUDE_DISCORD_NOTION": "true",
-    "WORKER_HYBRID_APPLY_GOOGLE_EVENTS": "false",
-    "SYNC_DO_LOCK_ENABLED": "true",
-    "SYNC_DO_LOCK_TTL_SECONDS": "120",
-    "CRON_ENABLE_SYNC": "true",
-    "CRON_ENABLE_DISCORD_NOTION_SYNC": "false",
-    "CRON_ENABLE_GCAL_WATCH_RENEW": "false",
-    "CRON_ENABLE_GCAL_WATCH_ENSURE": "true",
-    "GCAL_WATCH_RENEW_THRESHOLD_SECONDS": "86400",
-    "CRON_ENABLE_QA": "true",
-    "CRON_ENABLE_REMINDER": "true",
-    "CRON_ENABLE_AUTO_CLEAN": "true",
-    "CLEANUP_INTERVAL_SECONDS": "86400",
-    "DISCORD_TO_GOOGLE_SYNC_ENABLED": "true"
-  },
-  "triggers": {
-    "crons": [
-      "*/5 * * * *"
-    ]
-  }
+	"name": "ie-event-bot-workers",
+	"main": "src/entry.py",
+	"compatibility_date": "2026-03-07",
+	"compatibility_flags": [
+		"python_workers"
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "SYNC_COORDINATOR",
+				"class_name": "SyncCoordinator"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1-sync-coordinator",
+			"new_sqlite_classes": [
+				"SyncCoordinator"
+			]
+		}
+	],
+	"observability": {
+		"enabled": true
+	},
+	"vars": {
+		"SYNC_INTERVAL_SECONDS": "300",
+		"KV_SYNC_COOLDOWN_ENABLED": "true",
+		"KV_GCAL_DEDUPE_ENABLED": "true",
+		"WORKER_SYNC_ALL_MODE": "native",
+		"WORKER_HYBRID_INCLUDE_DISCORD_NOTION": "true",
+		"WORKER_HYBRID_APPLY_GOOGLE_EVENTS": "false",
+		"SYNC_DO_LOCK_ENABLED": "true",
+		"SYNC_DO_LOCK_TTL_SECONDS": "120",
+		"CRON_ENABLE_SYNC": "true",
+		"CRON_ENABLE_DISCORD_NOTION_SYNC": "false",
+		"CRON_ENABLE_GCAL_WATCH_RENEW": "false",
+		"CRON_ENABLE_GCAL_WATCH_ENSURE": "true",
+		"GCAL_WATCH_RENEW_THRESHOLD_SECONDS": "86400",
+		"CRON_ENABLE_QA": "true",
+		"CRON_ENABLE_REMINDER": "true",
+		"CRON_ENABLE_AUTO_CLEAN": "true",
+		"CLEANUP_INTERVAL_SECONDS": "86400",
+		"DISCORD_TO_GOOGLE_SYNC_ENABLED": "true",
+
+		"GCAL_WEBHOOK_URL": "",
+		"GOOGLE_CALENDAR_ID": "3a68d6d22b29a086c887d15d3cb6b4f3e8c1d92a501cb15a7a3b8d560a6df810@group.calendar.google.com",
+		"NOTION_EVENT_INTERNAL_ID": "2dcdf9285c70807aa54bc419d1f1d139",
+		"DISCORD_GUILD_ID": "1446782542882541649",
+
+		"NOTION_EVENT_ID": "2c1df9285c708080b619fd43686e92e6",
+		"NOTION_QA_ID": "58ea988d55a6441e99937afe80283631",
+		"QA_CHANNEL_ID": "1446942444699779183",
+		"REMINDER_CHANNEL_ID": "1446942444699779183",
+		"REMINDER_ROLE_ID": "1471243577354092668",
+		"REMINDER_WINDOW_MINUTES": 15
+	},
+	"triggers": {
+		"crons": [
+			"*/5 * * * *"
+		]
+	},
+	"kv_namespaces": [
+		{
+			"binding": "STATE_KV",
+			"id": "ede4ebb047b04468835193b1aa3567da",
+			"preview_id": "bfca026d6b79429780512cfc8e6eb296",
+			"remote": true
+		}
+	]
 }
