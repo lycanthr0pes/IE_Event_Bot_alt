@@ -202,7 +202,58 @@ def _load_service_account_info_from_env(env):
     return None
 
 
-def _sign_rs256(message: bytes, private_key_pem: str):
+def _pem_pkcs8_to_der(private_key_pem: str):
+    """
+    PEM 形式の PKCS8 秘密鍵を DER(bytes) に変換する。
+    """
+    lines = [line.strip() for line in str(private_key_pem or "").splitlines()]
+    body = [
+        line for line in lines
+        if line and not line.startswith("-----BEGIN") and not line.startswith("-----END")
+    ]
+    if not body:
+        return None
+    try:
+        return base64.b64decode("".join(body))
+    except Exception:
+        return None
+
+
+def _js_uint8_array(data: bytes):
+    """
+    Python bytes を JS Uint8Array に変換する。
+    """
+    try:
+        js = __import__("js")
+        arr = js.Uint8Array.new(len(data))
+        for i, b in enumerate(data):
+            arr[i] = int(b)
+        return arr
+    except Exception:
+        return None
+
+
+def _uint8_array_to_bytes(js_arr):
+    """
+    JS Uint8Array を Python bytes に変換する。
+    """
+    if js_arr is None:
+        return None
+    try:
+        return bytes(js_arr.to_py())
+    except Exception:
+        pass
+    try:
+        length = int(getattr(js_arr, "length", 0) or 0)
+        out = bytearray(length)
+        for i in range(length):
+            out[i] = int(js_arr[i])
+        return bytes(out)
+    except Exception:
+        return None
+
+
+async def _sign_rs256(message: bytes, private_key_pem: str):
     """
     RS256 署名を行う。
     - `cryptography` 優先（PKCS8 対応）
@@ -227,10 +278,33 @@ def _sign_rs256(message: bytes, private_key_pem: str):
         key = rsa.PrivateKey.load_pkcs1(private_key_pem.encode("utf-8"))
         return rsa.sign(message, key, "SHA-256")
     except Exception:
+        pass
+
+    # WebCrypto (Workers runtime fallback)
+    try:
+        der = _pem_pkcs8_to_der(private_key_pem)
+        if not der:
+            return None
+        key_bytes = _js_uint8_array(der)
+        msg_bytes = _js_uint8_array(message)
+        if key_bytes is None or msg_bytes is None:
+            return None
+        js = __import__("js")
+        key = await js.crypto.subtle.importKey(
+            "pkcs8",
+            key_bytes,
+            {"name": "RSASSA-PKCS1-v1_5", "hash": {"name": "SHA-256"}},
+            False,
+            ["sign"],
+        )
+        sig_buffer = await js.crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, msg_bytes)
+        sig_arr = js.Uint8Array.new(sig_buffer)
+        return _uint8_array_to_bytes(sig_arr)
+    except Exception:
         return None
 
 
-def _build_service_account_assertion(sa_info: dict, scope: str):
+async def _build_service_account_assertion(sa_info: dict, scope: str):
     """
     OAuth JWT Bearer 用 JWT を生成する。
     """
@@ -255,7 +329,7 @@ def _build_service_account_assertion(sa_info: dict, scope: str):
     header_b64 = _b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
     payload_b64 = _b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
-    signature = _sign_rs256(signing_input, private_key)
+    signature = await _sign_rs256(signing_input, private_key)
     if not signature:
         return None
     return f"{header_b64}.{payload_b64}.{_b64url(signature)}"
@@ -269,7 +343,7 @@ async def _fetch_token_from_service_account(env, state):
     sa_info = _load_service_account_info_from_env(env)
     if not sa_info:
         return None
-    assertion = _build_service_account_assertion(
+    assertion = await _build_service_account_assertion(
         sa_info,
         "https://www.googleapis.com/auth/calendar",
     )
