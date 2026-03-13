@@ -15,7 +15,17 @@ if _runtime_fetch is None:
     async def fetch(*args, **kwargs):
         raise RuntimeError("fetch_not_available")
 else:
-    fetch = _runtime_fetch
+    async def fetch(url, options=None):
+        opts = options or {}
+        try:
+            return await _runtime_fetch(
+                url,
+                method=opts.get("method"),
+                headers=opts.get("headers"),
+                body=opts.get("body"),
+            )
+        except TypeError:
+            return await _runtime_fetch(url, opts)
 
 if TYPE_CHECKING:
     fetch: Any
