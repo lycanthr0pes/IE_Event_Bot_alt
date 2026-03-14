@@ -60,4 +60,5 @@ artifacts/
 .dev.vars
 .dev.vars.*
 workers/service-account.json
-workers/README_OPERATIONS_JA.md
+workers/README_OPERATIONS.md
+workers/README_KV.md

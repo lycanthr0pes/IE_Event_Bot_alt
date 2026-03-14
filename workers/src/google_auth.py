@@ -39,6 +39,8 @@ Google API アクセストークン解決モジュール。
 """
 
 _last_service_account_error = None
+_last_assertion_error = None
+_last_sign_error = None
 
 
 def _b64url(data: bytes) -> str:
@@ -256,8 +258,10 @@ def _uint8_array_to_bytes(js_arr):
 
 
 async def _sign_rs256(message: bytes, private_key_pem: str):
+    global _last_sign_error
+    _last_sign_error = None
     """
-    RS256 署名を行う。
+    RS256 秘密鍵署名を行う。
     - `cryptography` 優先（PKCS8 対応）
     - 失敗時 `rsa` パッケージへフォールバック（PKCS1 対応）
     """
@@ -270,7 +274,10 @@ async def _sign_rs256(message: bytes, private_key_pem: str):
         key = load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
         sig = key.sign(message, padding.PKCS1v15(), hashes.SHA256())
         return sig
-    except Exception:
+    # 例外 -> exc
+    # 失敗した署名方法 : 例外の型 : メッセージ
+    except Exception as exc:
+        _last_sign_error = f"cryptography_failed:{type(exc).__name__}:{str(exc)[:160]}"
         pass
 
     # RSA
@@ -279,30 +286,41 @@ async def _sign_rs256(message: bytes, private_key_pem: str):
 
         key = rsa.PrivateKey.load_pkcs1(private_key_pem.encode("utf-8"))
         return rsa.sign(message, key, "SHA-256")
-    except Exception:
+    except Exception as exc:
+        _last_sign_error = f"rsa_failed:{type(exc).__name__}:{str(exc)[:160]}"
         pass
 
-    # WebCrypto (Workers runtime fallback)
+    # WebCrypto フォールバック
     try:
+        # PEM文字列を PKCS#8 DER バイト列に変換
         der = _pem_pkcs8_to_der(private_key_pem)
         if not der:
             return None
+        # Python の bytes を JS 用の Uint8Array に変換
         key_bytes = _js_uint8_array(der)
         msg_bytes = _js_uint8_array(message)
         if key_bytes is None or msg_bytes is None:
             return None
+        """
+        鍵の目的指定。
+        Python 配列は不可なので JS 配列を渡す。
+        """
         js = __import__("js")
+        usages = js.Array.new()
+        usages.push("sign")
         key = await js.crypto.subtle.importKey(
             "pkcs8",
             key_bytes,
             {"name": "RSASSA-PKCS1-v1_5", "hash": {"name": "SHA-256"}},
             False,
-            ["sign"],
+            usages,
         )
+        # 署名
         sig_buffer = await js.crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, msg_bytes)
         sig_arr = js.Uint8Array.new(sig_buffer)
         return _uint8_array_to_bytes(sig_arr)
-    except Exception:
+    except Exception as exc:
+        _last_sign_error = f"webcrypto_failed:{type(exc).__name__}:{str(exc)[:160]}"
         return None
 
 
@@ -310,16 +328,21 @@ async def _build_service_account_assertion(sa_info: dict, scope: str):
     """
     OAuth JWT Bearer 用 JWT を生成する。
     """
+    global _last_assertion_error
+    _last_assertion_error = None
     private_key = str(sa_info.get("private_key") or "").strip()
     client_email = str(sa_info.get("client_email") or "").strip()
     private_key_id = str(sa_info.get("private_key_id") or "").strip()
     if not private_key or not client_email:
+        _last_assertion_error = "missing_private_key_or_client_email"
         return None
 
+    # ヘッダ作成
     now = int(time.time())
     header = {"alg": "RS256", "typ": "JWT"}
     if private_key_id:
         header["kid"] = private_key_id
+    # JWT ペイロード作成
     payload = {
         "iss": client_email,
         "scope": scope,
@@ -328,11 +351,40 @@ async def _build_service_account_assertion(sa_info: dict, scope: str):
         "exp": now + 3600,
         "jti": str(uuid4()),
     }
+    # google-auth が使える場合は RSA signer 実装に委譲する
+    try:
+        from google.auth import crypt as gcrypt, jwt as gjwt
+
+        signer = gcrypt.RSASigner.from_service_account_info(sa_info)
+        token = gjwt.encode(
+            signer,
+            payload,
+            header=header,
+        )
+        if isinstance(token, bytes):
+            return token.decode("utf-8")
+        return str(token)
+    # 無理なら自前で作る
+    except Exception as exc:
+        _last_assertion_error = f"google_auth_signer_failed:{type(exc).__name__}:{str(exc)[:160]}"
+        pass
+
     header_b64 = _b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
     payload_b64 = _b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
     signature = await _sign_rs256(signing_input, private_key)
+    # エラー箇所確認用( signer 不可 + 鍵署名失敗)
     if not signature:
+        global _last_sign_error
+        if _last_assertion_error:
+            _last_assertion_error = (
+                f"{_last_assertion_error};fallback_sign_failed"
+                + (f":{_last_sign_error}" if _last_sign_error else "")
+            )
+        else:
+            _last_assertion_error = "fallback_sign_failed" + (
+                f":{_last_sign_error}" if _last_sign_error else ""
+            )
         return None
     return f"{header_b64}.{payload_b64}.{_b64url(signature)}"
 
@@ -353,7 +405,8 @@ async def _fetch_token_from_service_account(env, state):
         "https://www.googleapis.com/auth/calendar",
     )
     if not assertion:
-        _last_service_account_error = "service_account_assertion_build_failed"
+        detail = _last_assertion_error or "unknown"
+        _last_service_account_error = f"service_account_assertion_build_failed:{detail}"
         return None
 
     body = (

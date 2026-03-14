@@ -516,22 +516,21 @@ class Default(WorkerEntrypoint):
         owner = f"{source}-{int(time.time())}-{uuid4()}"
         try:
             # 同期ロックはグローバルに1つ
-            stub = do_ns.get_by_name("global")
+            stub = self._get_sync_stub(do_ns)
             # SyncCoordinator acquire を呼ぶ
-            response = await stub.fetch(
+            response = await self._do_stub_fetch(
+                stub,
                 "https://sync-lock/acquire",
-                {
-                    "method": "POST",
-                    "headers": {"content-type": "application/json"},
-                    "body": json.dumps(
-                        {
-                            "action": "acquire",
-                            "owner": owner,
-                            "ttl_seconds": self._sync_lock_ttl_seconds(),
-                        },
-                        ensure_ascii=False,
-                    ),
-                },
+                method="POST",
+                headers={"content-type": "application/json"},
+                body=json.dumps(
+                    {
+                        "action": "acquire",
+                        "owner": owner,
+                        "ttl_seconds": self._sync_lock_ttl_seconds(),
+                    },
+                    ensure_ascii=False,
+                ),
             )
             # 読み取り
             text = await response.text()
@@ -552,18 +551,17 @@ class Default(WorkerEntrypoint):
         if do_ns is None or not owner:
             return
         try:
-            stub = do_ns.get_by_name("global")
+            stub = self._get_sync_stub(do_ns)
             # SyncCoordinator release を呼ぶ
-            await stub.fetch(
+            await self._do_stub_fetch(
+                stub,
                 "https://sync-lock/release",
-                {
-                    "method": "POST",
-                    "headers": {"content-type": "application/json"},
-                    "body": json.dumps(
-                        {"action": "release", "owner": owner},
-                        ensure_ascii=False,
-                    ),
-                },
+                method="POST",
+                headers={"content-type": "application/json"},
+                body=json.dumps(
+                    {"action": "release", "owner": owner},
+                    ensure_ascii=False,
+                ),
             )
         except Exception:
             return
@@ -587,6 +585,10 @@ class Default(WorkerEntrypoint):
         - last_results
         - lock 状態
         """
+        connectivity_checks = None
+        # include_checks 実行時は先に外部疎通を実行し、google_auth 診断に直近エラーを反映する
+        if include_checks:
+            connectivity_checks = await run_connectivity_checks(self.env, state)
         # Google 認証
         google_auth = await describe_google_auth_sources(self.env, state)
         # 最後に同期成功した時刻
@@ -634,7 +636,7 @@ class Default(WorkerEntrypoint):
             "sync_lock": await self._sync_lock_status(),
         }
         if include_checks:
-            payload["connectivity_checks"] = await run_connectivity_checks(self.env, state)
+            payload["connectivity_checks"] = connectivity_checks
         return payload
 
     async def _sync_lock_status(self):
@@ -643,15 +645,14 @@ class Default(WorkerEntrypoint):
         if do_ns is None:
             return {"enabled": False, "reason": "no_binding"}
         try:
-            stub = do_ns.get_by_name("global")
-            response = await stub.fetch(
-            # Durable Object statusを呼ぶ 
+            stub = self._get_sync_stub(do_ns)
+            # Durable Object status リクエスト
+            response = await self._do_stub_fetch(
+                stub,
                 "https://sync-lock/status",
-                {
-                    "method": "POST",
-                    "headers": {"content-type": "application/json"},
-                    "body": json.dumps({"action": "status"}, ensure_ascii=False),
-                },
+                method="POST",
+                headers={"content-type": "application/json"},
+                body=json.dumps({"action": "status"}, ensure_ascii=False),
             )
             # 読み取り
             text = await response.text()
@@ -661,8 +662,43 @@ class Default(WorkerEntrypoint):
             except Exception:
                 data = {}
             return {"enabled": True, "status": int(response.status), **data}
-        except Exception:
-            return {"enabled": True, "error": "status_exception"}
+        except Exception as exc:
+            return {"enabled": True, "error": "status_exception", "detail": str(exc)[:200]}
+
+    @staticmethod
+    def _get_sync_stub(do_ns):
+        """
+        Durable Object namespace から "global" stub を取得(DO生成)する。
+        """
+        if hasattr(do_ns, "get_by_name"):
+            return do_ns.get_by_name("global")
+        if hasattr(do_ns, "id_from_name") and hasattr(do_ns, "get"):
+            return do_ns.get(do_ns.id_from_name("global"))
+        if hasattr(do_ns, "idFromName") and hasattr(do_ns, "get"):
+            return do_ns.get(do_ns.idFromName("global"))
+        raise AttributeError("no_supported_do_namespace_api")
+
+    @staticmethod
+    async def _do_stub_fetch(stub, url: str, *, method: str, headers: dict, body: str):
+        """
+        Durable Object stub.fetch の呼び出し差分を吸収する。
+        """
+        try:
+            return await stub.fetch(
+                url,
+                method=method,
+                headers=headers,
+                body=body,
+            )
+        except TypeError:
+            return await stub.fetch(
+                url,
+                {
+                    "method": method,
+                    "headers": headers,
+                    "body": body,
+                },
+            )
 
     @staticmethod
     def _to_bool_query(query_string: str, key: str) -> bool:
