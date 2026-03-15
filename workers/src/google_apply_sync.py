@@ -158,6 +158,49 @@ def _notion_extract_rich_text(page: dict, prop_name: str):
     return None
 
 
+def _resolve_discord_event_id_for_google_event(
+    env,
+    google_event_id: str,
+    notion_page: dict | None,
+    fallback_page: dict | None,
+    gcal_discord_map: dict,
+) -> str | None:
+    """
+    Googleイベントに対応する Discord event id を既知情報から推定する。
+
+    探索順:
+    1) internal/external Notion page の message_id
+    2) KV の gcal_discord_map
+    """
+    prop_message_id = _prop(env, "NOTION_PROP_MESSAGE_ID", "メッセージID")
+    notion_discord_id = _notion_extract_rich_text(notion_page, prop_message_id)
+    if notion_discord_id:
+        return notion_discord_id
+    fallback_discord_id = _notion_extract_rich_text(fallback_page, prop_message_id)
+    if fallback_discord_id:
+        return fallback_discord_id
+    mapped_id = str((gcal_discord_map or {}).get(google_event_id) or "").strip()
+    return mapped_id or None
+
+
+def _google_private_props(event: dict) -> dict:
+    """Google event.extendedProperties.private を辞書で返す。"""
+    props = (((event or {}).get("extendedProperties") or {}).get("private") or {})
+    return props if isinstance(props, dict) else {}
+
+
+def _google_origin_discord_event_id(event: dict) -> str | None:
+    """
+    Discord 由来で Google に作られたイベントなら元の Discord event id を返す。
+    """
+    props = _google_private_props(event)
+    origin = str(props.get("ie_origin") or "").strip().lower()
+    discord_event_id = str(props.get("ie_discord_event_id") or "").strip()
+    if origin == "discord" and discord_event_id:
+        return discord_event_id
+    return None
+
+
 async def _notion_query_by_google_event_id(env, db_id: str, google_event_id: str):
     """GoogleイベントID一致で Notion ページを1件検索する。"""
     if not db_id or not google_event_id:
@@ -512,7 +555,7 @@ async def _discord_delete_event(env, discord_event_id: str):
 async def _sync_to_discord(env, event: dict, notion_page: dict, fallback_page: dict, gcal_discord_map: dict):
     """
     Googleイベントを Discord 側へ同期し、DiscordイベントIDを返す。
-    Discord ID(message_id / mapped_id) 探索順:
+ws    Discord ID(message_id / mapped_id) 探索順:
     1) notion_page.message_id
     2) fallback_page.message_id
     3) KVマップ(gcal_discord_map)
@@ -559,69 +602,129 @@ async def _sync_to_discord(env, event: dict, notion_page: dict, fallback_page: d
 
 async def apply_google_events(env, state, events: list[dict]):
     """
-    Google差分イベント群を Notion/Discord へ適用する。
-    - 内部/外部DBを別々に扱い、片方失敗でも処理継続
-    - map が壊れていても DB 再検索で自己修復
-    - イベント単位で例外をハンドルし、error_count へ集約
+    Google Calendar のイベント一覧を受け取り、Notion と Discord に反映する。
+    1回で処理しすぎないように件数制限し、失敗分は次回へ繰り越す。
     """
-    """ Google -> Notion同期 """
     internal_db = _env_text(env, "NOTION_EVENT_INTERNAL_ID", "")
     external_db = _env_text(env, "NOTION_EVENT_ID", "")
     if not _env_text(env, "NOTION_TOKEN", "") or not internal_db:
         return {"ok": False, "error": "missing_notion_env", "processed": 0}
 
+    # 1回あたりの最大処理件数を決める
+    queue_key = "sync:google_apply_queue"
+    max_events_raw = _env_text(env, "GOOGLE_APPLY_MAX_EVENTS_PER_RUN", "10")
+    try:
+        max_events = max(1, int(max_events_raw))
+    except Exception:
+        max_events = 10
+
+    # state からマップとキューを読む
     if state.enabled():
-        # GoogleイベントID → DiscordイベントID の対応表
         gcal_discord_map = await state.get_gcal_discord_map()
-        # GoogleイベントID → NotionページID の対応表
         gcal_notion_map = await state.get_gcal_notion_map()
+        queued_events = await state.get_json(queue_key, [])
+        if not isinstance(queued_events, list):
+            queued_events = []
     else:
         gcal_discord_map = {}
         gcal_notion_map = {"internal": {}, "external": {}}
+        queued_events = []
+ 
+    # 今回渡されたイベントと、前回残りをマージ
+    # 新イベント
+    incoming_events = list(events or [])
+    # キュー内イベント
+    known_ids = {str((e or {}).get("id") or "") for e in queued_events} 
+    # 処理するイベント
+    merged_queue = list(queued_events)
+    for event in incoming_events:
+        event_id = str((event or {}).get("id") or "")
+        if not event_id or event_id in known_ids:
+            continue
+        merged_queue.append(event)
+        known_ids.add(event_id)
+
+    # 今回処理する分と、次回に回す分を分ける
+    target_events = merged_queue[:max_events]
+    remaining_events = merged_queue[max_events:]
 
     processed = 0
     had_error = False
     errors = []
-    # Notion マップの内部辞書
     internal_map = gcal_notion_map.get("internal") or {}
     external_map = gcal_notion_map.get("external") or {}
+    retry_events = []
 
-    for event in events or []:
+    # 各Googleイベントを1件ずつ処理
+    for event in target_events:
         google_event_id = str((event or {}).get("id") or "")
         if not google_event_id:
             continue
+        origin_discord_event_id = _google_origin_discord_event_id(event)
         processed += 1
+        event_failed = False
         try:
-            # internal page 解決（マップ -> 直接取得 -> DB検索）
+            # Notion内部DB (マップ -> direct fetch -> DBクエリ).
             page = None
             mapped_internal_page_id = str(internal_map.get(google_event_id) or "")
+            # マップで引く
             if mapped_internal_page_id:
                 page = await _notion_get_page(env, mapped_internal_page_id)
-                # 古いマップを消す
+                # ページが無ければ削除
                 if not page:
                     internal_map.pop(google_event_id, None)
+            # GoogleイベントIDでDB検索
             if not page:
                 page = await _notion_query_by_google_event_id(env, internal_db, google_event_id)
-                # マップ自己修復
+                if page and page.get("id"):
+                    internal_map[google_event_id] = str(page["id"])
+            # Discord由来なら DiscordイベントID でも探す
+            if not page and origin_discord_event_id:
+                page = await _notion_query_by_message_id(env, internal_db, origin_discord_event_id)
                 if page and page.get("id"):
                     internal_map[google_event_id] = str(page["id"])
 
-            # external page 解決（マップ -> message_id検索 -> google_id検索）
+            # Notion外部DB (マップ -> direct fetch -> DBクエリ).
             external_page = None
             if external_db:
                 mapped_external_page_id = str(external_map.get(google_event_id) or "")
+                # マップで引く
                 if mapped_external_page_id:
                     external_page = await _notion_get_page(env, mapped_external_page_id)
+                    # ページが無ければ削除
                     if not external_page:
                         external_map.pop(google_event_id, None)
+                # GoogleイベントIDでDB検索
                 if not external_page:
                     external_page = await _notion_query_by_message_id(env, external_db, google_event_id)
                     if not external_page:
                         external_page = await _notion_query_by_google_event_id(env, external_db, google_event_id)
+                    if not external_page:
+                        discord_event_id = _resolve_discord_event_id_for_google_event(
+                            env,
+                            google_event_id,
+                            page,
+                            None,
+                            gcal_discord_map,
+                        )
+                        # Discord同期済みなら、その DiscordイベントID で探す
+                        if discord_event_id:
+                            external_page = await _notion_query_by_message_id(
+                                env,
+                                external_db,
+                                discord_event_id,
+                            )
+                    # Discord由来なら DiscordイベントID でも探す
+                    if not external_page and origin_discord_event_id:
+                        external_page = await _notion_query_by_message_id(
+                            env,
+                            external_db,
+                            origin_discord_event_id,
+                        )
                     if external_page and external_page.get("id"):
                         external_map[google_event_id] = str(external_page["id"])
 
-            # Googleカレンダーから削除されたイベントをNotion側で削除
+            # キャンセル済みイベントの処理
             if (event or {}).get("status") == "cancelled":
                 if page:
                     await _notion_archive_page(env, page)
@@ -629,24 +732,29 @@ async def apply_google_events(env, state, events: list[dict]):
                 if external_page:
                     await _notion_archive_page(env, external_page)
                     external_map.pop(google_event_id, None)
-                await _sync_to_discord(env, event, page, external_page, gcal_discord_map)
+                if origin_discord_event_id:
+                    gcal_discord_map[google_event_id] = origin_discord_event_id
+                else:
+                    await _sync_to_discord(env, event, page, external_page, gcal_discord_map)
                 continue
 
-            # Notion 書き込み用の情報を準備
-            name = str((event or {}).get("summary") or "(タイトルなし)")
-            content = str((event or {}).get("description") or "(本文なし)")
+            # イベント内容を取り出す
+            name = str((event or {}).get("summary") or "(untitled)")
+            content = str((event or {}).get("description") or "")
             event_url = (event or {}).get("htmlLink")
             location = (event or {}).get("location")
-            creator_id = str((((event or {}).get("creator") or {}).get("email")) or "不明")
+            creator_id = str((((event or {}).get("creator") or {}).get("email")) or "unknown")
             _start_dt, end_dt = _parse_google_event_times(event)
             now_utc = datetime.now(timezone.utc)
-            # 内部DBページがまだ無くて、しかもそのイベントがすでに終了済みなら、新規作成しない
+            # すでに終わったイベントは内部ページ新規作成しない
             skip_internal_create = page is None and end_dt is not None and end_dt.astimezone(timezone.utc) <= now_utc
+            # Notionの日付プロパティを作る
             date_prop = _build_notion_date(event)
             if not date_prop:
                 continue
 
-            # 内部用Noitonページ更新
+            # 内部Notionページを更新または作成
+            # 既存ページがある場合は更新
             if page:
                 ok = await _notion_update_event(
                     env,
@@ -660,12 +768,12 @@ async def apply_google_events(env, state, events: list[dict]):
                 )
                 if not ok:
                     had_error = True
+                    event_failed = True
                     errors.append(f"notion_internal_update_failed:{google_event_id}")
                 else:
                     internal_map[google_event_id] = str(page["id"])
-
-            # 内部用Noitonページ作成
-            elif not skip_internal_create:
+            # ページが無い場合は作成
+            elif not skip_internal_create and not origin_discord_event_id:
                 page_id = await _notion_create_event(
                     env,
                     internal_db,
@@ -680,13 +788,15 @@ async def apply_google_events(env, state, events: list[dict]):
                 )
                 if not page_id:
                     had_error = True
+                    event_failed = True
                     errors.append(f"notion_internal_create_failed:{google_event_id}")
                     continue
                 page = {"id": page_id, "properties": {}}
                 internal_map[google_event_id] = str(page_id)
 
-            # 外部用Noitonページ更新
+            # 外部Notionページを更新または作成
             if external_db:
+                # 既存ページがある場合は更新
                 if external_page:
                     ext_ok = await _notion_update_event(
                         env,
@@ -695,15 +805,16 @@ async def apply_google_events(env, state, events: list[dict]):
                         content=content,
                         date_prop=date_prop,
                         message_id=google_event_id,
+                        google_event_id=google_event_id,
                     )
                     if not ext_ok:
                         had_error = True
+                        event_failed = True
                         errors.append(f"notion_external_update_failed:{google_event_id}")
                     else:
                         external_map[google_event_id] = str(external_page["id"])
-
-                # 外部用Noitonページ作成
-                else:
+                # ページが無い場合は作成
+                elif not origin_discord_event_id:
                     ext_page_id = await _notion_create_event(
                         env,
                         external_db,
@@ -712,45 +823,66 @@ async def apply_google_events(env, state, events: list[dict]):
                         date_prop=date_prop,
                         creator_id=creator_id,
                         event_url=None,
-                        google_event_id=None,
+                        google_event_id=google_event_id,
                         location=None,
                         message_id=google_event_id,
                     )
                     if not ext_page_id:
                         had_error = True
+                        event_failed = True
                         errors.append(f"notion_external_create_failed:{google_event_id}")
                     else:
                         external_page = {"id": ext_page_id, "properties": {}}
                         external_map[google_event_id] = str(ext_page_id)
 
-            """ Google -> Discord同期 -> Discord IDを返す """
-            discord_event_id = await _sync_to_discord(
-                env,
-                event,
-                page,
-                external_page,
-                gcal_discord_map,
-            )
+            # Google -> Discord 同期.
+            # 元が Discord 由来なら元 Discord イベントIDをそのまま使う
+            if origin_discord_event_id:
+                discord_event_id = origin_discord_event_id
+                gcal_discord_map[google_event_id] = origin_discord_event_id
+            # そうでなければ Googleイベントを Discord 側へ作成または更新
+            else:
+                discord_event_id = await _sync_to_discord(
+                    env,
+                    event,
+                    page,
+                    external_page,
+                    gcal_discord_map,
+                )
 
-            # Discord ID を Notion に書き戻す
+            # Notionページに Discord ID を書き戻す
             if page and discord_event_id:
                 await _notion_update_event(env, page["id"], message_id=discord_event_id)
             if external_page and discord_event_id:
                 await _notion_update_event(env, external_page["id"], message_id=discord_event_id)
-        except Exception:
+        except Exception as exc:
             had_error = True
-            errors.append(f"exception:{google_event_id}")
+            event_failed = True
+            detail = str(exc)
+            if "too many subrequests" in detail.lower():
+                errors.append(f"subrequests_exceeded:{google_event_id}")
+                retry_events.append(event)
+                break
+            errors.append(f"exception:{google_event_id}:{type(exc).__name__}")
 
-    # マップ保存
+        if event_failed:
+            retry_events.append(event)
+
+    # 次回のためにマップとキューを保存
     gcal_notion_map["internal"] = internal_map
     gcal_notion_map["external"] = external_map
+    next_queue = retry_events + remaining_events
+    pending_events = len(next_queue)
     if state.enabled():
         await state.set_gcal_discord_map(gcal_discord_map)
         await state.set_gcal_notion_map(gcal_notion_map)
+        await state.put_json(queue_key, next_queue)
 
     return {
         "ok": not had_error,
         "processed": processed,
+        "pending_events": pending_events,
+        "max_events_per_run": max_events,
         "error_count": len(errors),
         "errors": errors[:20],
     }

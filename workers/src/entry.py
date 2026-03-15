@@ -431,7 +431,10 @@ class Default(WorkerEntrypoint):
                         await state.set_sync_updated_min(next_cursor)
                 discord_result = {"ok": True, "skipped": True}
                 # Discord 同期を実行するか判定
-                should_include_discord = self._hybrid_include_discord_notion() or mode == "native"
+                should_include_discord = (
+                    self._sync_all_include_discord_notion()
+                    and (self._hybrid_include_discord_notion() or mode == "native")
+                )
                 if should_include_discord:
                     discord_result = await run_discord_notion_poll_sync(self.env, state)
                 # 全体成功判定
@@ -490,6 +493,13 @@ class Default(WorkerEntrypoint):
         return _bool_env(
             getattr(self.env, "WORKER_HYBRID_INCLUDE_DISCORD_NOTION", "true"),
             default=True,
+        )
+
+    def _sync_all_include_discord_notion(self) -> bool:
+        """/sync/all で Discord->Notion を実行するか。"""
+        return _bool_env(
+            getattr(self.env, "SYNC_ALL_INCLUDE_DISCORD_NOTION", "false"),
+            default=False,
         )
 
     def _hybrid_apply_google_events(self) -> bool:
@@ -616,6 +626,7 @@ class Default(WorkerEntrypoint):
             "mode": self._sync_all_mode(),
             "kv_enabled": state.enabled(),
             "features": {
+                "sync_all_include_discord_notion": self._sync_all_include_discord_notion(),
                 "hybrid_include_discord_notion": self._hybrid_include_discord_notion(),
                 "hybrid_apply_google_events": self._hybrid_apply_google_events(),
             },

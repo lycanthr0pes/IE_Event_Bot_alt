@@ -139,22 +139,28 @@ async def run_google_delta_fetch(env, state, *, commit_cursor: bool = True):
         return {"ok": False, "error": "missing_google_access_token", "events": 0}
 
     updated_min = await state.get_sync_updated_min() if state.enabled() else None
-    if not updated_min:
-        # 初回は 30 日分を取得。
-        updated_min = _to_rfc3339_z(datetime.now(timezone.utc) - timedelta(days=30))
-    else:
+    if updated_min:
         dt = _parse_rfc3339(updated_min)
         if dt is not None:
-            # API 遅延や境界ズレを吸収するため 2 分巻き戻してカーソルを再取得する。
             updated_min = _to_rfc3339_z(dt - timedelta(minutes=2))
-
+        else:
+            # KVの同期カーソルが壊れていたら完全同期を実行する.
+            updated_min = None
+    # 同期カーソル無しの最初の同期は常に完全同期を実行する.
     events, status, body = await _google_events_list(
         calendar_id,
         bearer_token,
         updated_min=updated_min,
     )
+    if events is None and status == 400 and updated_min:
+        # カーソルが壊れている場合は完全同期にフォールバック.
+        events, status, body = await _google_events_list(
+            calendar_id,
+            bearer_token,
+            updated_min=None,
+        )
     if events is None and status == 410:
-        # カーソルが古すぎる場合は完全同期にフォールバック。
+        # カーソルが古すぎる場合は完全同期にフォールバック.
         events, status, body = await _google_events_list(
             calendar_id,
             bearer_token,

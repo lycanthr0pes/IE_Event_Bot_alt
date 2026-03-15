@@ -196,18 +196,25 @@ async def _discord_api_request(env, method: str, path: str, payload=None):
     url = f"https://discord.com/api/v10{path}" # v10
     body = None if payload is None else json.dumps(payload, ensure_ascii=False)
     # Discord REST API リクエスト
-    response = await fetch(
-        url,
-        {
-            "method": method.upper(),
-            "headers": {
-                "Authorization": f"Bot {token}",
-                "Content-Type": "application/json",
+    try:
+        response = await fetch(
+            url,
+            {
+                "method": method.upper(),
+                "headers": {
+                    "Authorization": f"Bot {token}",
+                    "Content-Type": "application/json",
+                },
+                "body": body,
             },
-            "body": body,
-        },
-    )
-    # 読み込み
+        )
+    except Exception as exc:
+        detail = str(exc).lower()
+        if "too many subrequests" in detail:
+            return None, 598
+        return None, 599
+
+    # レスポンス読み取り
     status = int(response.status)
     text = await response.text()
     if status >= 400:
@@ -223,19 +230,21 @@ async def _discord_api_request(env, method: str, path: str, payload=None):
 async def _list_discord_scheduled_events(env):
     """
     ギルド(サーバ)のイベント一覧を取得する。
-    取得失敗時は空配列を返し、同期処理全体を継続可能にする。
     """
     guild_id = _env_text(env, "DISCORD_GUILD_ID", "")
     if not guild_id:
-        return []
+        return None, "missing_discord_guild_id"
     result, _status = await _discord_api_request(
         env,
         "GET",
         f"/guilds/{guild_id}/scheduled-events?with_user_count=false",
     )
     if not isinstance(result, list):
-        return []
-    return result
+        status = int(_status or 0)
+        if status >= 400:
+            return None, f"discord_list_failed:{status}"
+        return None, "discord_list_invalid_response"
+    return result, None
 
 
 async def _notion_query_by_message_id(env, db_id: str, message_id: str):
@@ -447,7 +456,14 @@ def _google_sync_enabled(env) -> bool:
     return bool(_env_text(env, "GOOGLE_CALENDAR_ID", ""))
 
 
-def _google_event_body(name: str, description: str, start_dt, end_dt, location=None):
+def _google_event_body(
+    name: str,
+    description: str,
+    start_dt,
+    end_dt,
+    location=None,
+    discord_event_id: str | None = None,
+):
     """
     Discordイベント情報を Google Calendar events API 用のボディに変換する。
     """
@@ -459,6 +475,14 @@ def _google_event_body(name: str, description: str, start_dt, end_dt, location=N
     }
     if location:
         payload["location"] = str(location)
+    # Discord 側で作られたイベントであることを示す
+    if discord_event_id:
+        payload["extendedProperties"] = {
+            "private": {
+                "ie_origin": "discord",
+                "ie_discord_event_id": str(discord_event_id),
+            }
+        }
     return payload
 
 
@@ -559,7 +583,14 @@ async def _sync_discord_event_upsert(env, event: dict, google_token: str | None)
 
     # Google 同期（有効時）: 既存IDがあれば更新、なければ作成
     if _google_sync_enabled(env) and google_token:
-        google_payload = _google_event_body(name, description, start_dt, end_dt, location=location)
+        google_payload = _google_event_body(
+            name,
+            description,
+            start_dt,
+            end_dt,
+            location=location,
+            discord_event_id=event_id,
+        )
         if google_event_id:
             google_ok = await _google_update_event(env, google_token, google_event_id, google_payload)
             if not google_ok:
@@ -613,6 +644,7 @@ async def _sync_discord_event_upsert(env, event: dict, google_token: str | None)
                 content=description,
                 date_prop=date_prop,
                 message_id=event_id,
+                google_event_id=google_event_id,
             )
             if not ok:
                 return False
@@ -627,6 +659,7 @@ async def _sync_discord_event_upsert(env, event: dict, google_token: str | None)
                 creator_id=creator_id,
                 event_url=None,
                 location=None,
+                google_event_id=google_event_id,
             )
             if not created_id:
                 return False
@@ -664,15 +697,27 @@ async def run_discord_notion_poll_sync(env, state):
     """
     定期ポーリングのメイン処理。
     手順:
-    1) Discordイベント一覧を取得して現在のスナップショットを生成
-    2) KV の前回のスナップショットと比較して作成/更新/削除を判定
-    3) 各差分を Notion / Google に反映
-    4) 現在のスナップショットを保存して次回基準にする
+    1) 最大処理件数の制御
+    2) Discordイベント一覧を取得して現在のスナップショットを生成
+    3) KV の前回のキューとスナップショットと比較して作成/更新/削除を判定
+    4) 各差分を Notion / Google に反映
+    4) 現在のスナップショットとキューを保存して次回基準にする
     """
     # 現在のDiscord一覧から新スナップショットを生成。
-    events = await _list_discord_scheduled_events(env)
+    events, list_error = await _list_discord_scheduled_events(env)
+    if list_error:
+        return {
+            "ok": False,
+            "error": list_error,
+            "created": 0,
+            "updated": 0,
+            "deleted": 0,
+            "error_count": 1,
+            "errors": [list_error],
+        }
+
     current_snapshot = {} # フィンガープリント
-    current_events = {} # イベント本文
+    current_events = {} # イベント本体
     for event in events:
         normalized = _normalize_event(event)
         if not normalized:
@@ -685,6 +730,7 @@ async def run_discord_notion_poll_sync(env, state):
     previous_snapshot = await state.get_discord_snapshot() if state.enabled() else {}
     if not isinstance(previous_snapshot, dict):
         previous_snapshot = {}
+
     had_error = False
     errors = []
     google_token = None
@@ -701,31 +747,91 @@ async def run_discord_notion_poll_sync(env, state):
         if eid in previous_snapshot and current_snapshot[eid] != previous_snapshot[eid]
     ]
 
-    # 同期処理
-    for event_id in created_ids + updated_ids:
-        event = current_events.get(event_id)
-        if not event:
-            continue
-        ok = await _sync_discord_event_upsert(env, event, google_token)
-        if not ok:
-            had_error = True
-            errors.append(f"upsert_failed:{event_id}")
+    # 最大処理件数
+    max_changes_raw = _env_text(env, "DISCORD_NOTION_MAX_CHANGES_PER_RUN", "5")
+    try:
+        max_changes = max(1, int(max_changes_raw))
+    except Exception:
+        max_changes = 5
 
-    for event_id in deleted_ids:
-        ok = await _sync_discord_event_delete(env, event_id, google_token)
-        if not ok:
-            had_error = True
-            errors.append(f"delete_failed:{event_id}")
+    # キュー保存用のキーを決めて、前回の残りを state から読む
+    queue_key = "sync:discord_notion_queue"
+    queued_ops = []
+    if state.enabled():
+        raw_queue = await state.get_json(queue_key, [])
+        if isinstance(raw_queue, list):
+            queued_ops = raw_queue
+
+    # 変更対象IDを重複なくまとめる
+    merged_ids = []
+    seen_ids = set()
+    # まず残りキューから探す
+    for op in queued_ops:
+        event_id = str((op or {}).get("id") or "").strip()
+        if not event_id or event_id in seen_ids:
+            continue
+        seen_ids.add(event_id)
+        merged_ids.append(event_id)
+    # 登録された全イベントIDから探す
+    for event_id in created_ids + updated_ids + deleted_ids:
+        if event_id in seen_ids:
+            continue
+        seen_ids.add(event_id)
+        merged_ids.append(event_id)
+
+    merged_ops = []
+    # スナップショットを見て各イベントを作成/更新するか削除するか決める
+    for event_id in merged_ids:
+        op_type = "upsert" if event_id in current_snapshot else "delete"
+        merged_ops.append({"op": op_type, "id": event_id})
+
+    # 変更対象イベントを今回処理する分と残りに分ける
+    target_ops = merged_ops[:max_changes]
+    remaining_ops = merged_ops[max_changes:]
+    processed_count = 0
+    retry_ops = []
+
+    # 今回対象の操作を1件ずつ処理
+    for op in target_ops:
+        op_type = str((op or {}).get("op") or "")
+        event_id = str((op or {}).get("id") or "")
+        if not event_id:
+            continue
+        processed_count += 1
+        # 作成/更新
+        if op_type == "upsert":
+            event = current_events.get(event_id)
+            if not event:
+                retry_ops.append({"op": "delete", "id": event_id})
+                continue
+            ok = await _sync_discord_event_upsert(env, event, google_token)
+            if not ok:
+                had_error = True
+                errors.append(f"upsert_failed:{event_id}")
+                retry_ops.append({"op": "upsert", "id": event_id})
+        # 削除
+        else:
+            ok = await _sync_discord_event_delete(env, event_id, google_token)
+            if not ok:
+                had_error = True
+                errors.append(f"delete_failed:{event_id}")
+                retry_ops.append({"op": "delete", "id": event_id})
+
+    pending_changes = len(retry_ops) + len(remaining_ops)
 
     if state.enabled():
         # 次回差分計算の基準を更新する。
         await state.set_discord_snapshot(current_snapshot)
+        await state.put_json(queue_key, retry_ops + remaining_ops)
 
     return {
         "ok": not had_error,
         "created": len(created_ids),
         "updated": len(updated_ids),
         "deleted": len(deleted_ids),
+        "processed_changes": processed_count,
+        "pending_changes": pending_changes,
+        "max_changes_per_run": max_changes,
         "error_count": len(errors),
         "errors": errors[:20],
     }

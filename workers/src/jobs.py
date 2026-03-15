@@ -301,7 +301,7 @@ async def run_qa_notification_job(env, state, return_detail: bool = False):
         q_number = _extract_number(page, "質問番号")
         display = q_number if q_number is not None else "?"
         msg = (
-            f"質問(#{display}) に更新があります\n"
+            f"❓ 質問番号 #{display} に更新があります\n"
             f"質問: {question}\n"
             f"回答: {answer}"
         )
@@ -402,8 +402,8 @@ async def run_day_before_reminder_job(env, state, return_detail: bool = False):
 
         event_url = _discord_event_url(env, event_id) or ""
         msg = (
-            f"<@&{role_id}> "
-            "明日開催のイベントがあります\n"
+            f"<@&{role_id}>\n"
+            "🔔 明日開催のイベントがあります\n"
             f"{event_url}"
         )
         # Discord REST API メッセージ送信リクエスト

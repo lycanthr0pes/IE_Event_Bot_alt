@@ -5,6 +5,31 @@ from uuid import uuid4
 from workers import DurableObject, Response
 
 
+def _decode_lock_record(value) -> dict:
+    """
+    storage.get("lock") の返り値を lock 辞書へ正規化する。
+    - 新形式: JSON文字列
+    - 旧形式: dict（互換）
+    """
+    # 文字列ならJSONとして読む
+    if isinstance(value, str):
+        try:
+            data = json.loads(value or "{}")
+        except Exception:
+            data = {}
+    # 辞書ならそのまま使う
+    elif isinstance(value, dict):
+        data = value
+    else:
+        data = {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        "owner": str(data.get("owner") or ""),
+        "expires_at": float(data.get("expires_at") or 0),
+    }
+
+
 class SyncCoordinator(DurableObject):
     """
     同期処理の同時実行を抑止する Durable Object ロック。
@@ -34,8 +59,8 @@ class SyncCoordinator(DurableObject):
             ttl_seconds = float(payload.get("ttl_seconds") or 30)
             expires_at = now + max(1.0, ttl_seconds)
             # 現在のロック情報を読む(Durable Object のストレージから取得)
-            current = await self.ctx.storage.get("lock")
-            if isinstance(current, dict):
+            current = _decode_lock_record(await self.ctx.storage.get("lock"))
+            if current:
                 current_owner = str(current.get("owner") or "")
                 current_exp = float(current.get("expires_at") or 0)
                 """
@@ -54,7 +79,11 @@ class SyncCoordinator(DurableObject):
                         headers={"content-type": "application/json"},
                     )
             # 他人の有効ロックが無ければ、自分のロック情報を書き込む
-            await self.ctx.storage.put("lock", {"owner": owner, "expires_at": expires_at})
+            # Python Workers の DO storage は dict 直putで DataCloneError になる場合があるため文字列化して保存
+            await self.ctx.storage.put(
+                "lock",
+                json.dumps({"owner": owner, "expires_at": expires_at}, ensure_ascii=False),
+            )
             return Response(
                 json.dumps({"ok": True, "owner": owner, "expires_at": expires_at}, ensure_ascii=False),
                 status=200,
@@ -65,8 +94,8 @@ class SyncCoordinator(DurableObject):
         if action == "release":
             # owner 未指定なら強制解放、owner 指定時は一致する(自分のロック)場合のみ解放。
             owner = str(payload.get("owner") or "")
-            current = await self.ctx.storage.get("lock")
-            if isinstance(current, dict):
+            current = _decode_lock_record(await self.ctx.storage.get("lock"))
+            if current:
                 current_owner = str(current.get("owner") or "")
                 if not owner or owner == current_owner:
                     await self.ctx.storage.delete("lock")
@@ -78,9 +107,7 @@ class SyncCoordinator(DurableObject):
 
         if action == "status":
             # 監視用途。現在 lock と現在時刻(now)を返す。
-            current = await self.ctx.storage.get("lock")
-            if not isinstance(current, dict):
-                current = {}
+            current = _decode_lock_record(await self.ctx.storage.get("lock"))
             current["now"] = now
             return Response(
                 json.dumps({"ok": True, "lock": current}, ensure_ascii=False),
