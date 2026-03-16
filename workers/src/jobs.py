@@ -313,7 +313,7 @@ async def run_qa_notification_job(env, state, return_detail: bool = False):
 
     # キャッシュ保存
     if state.enabled():
-        await state.put_json("qa_cache", new_cache)
+        await state.put_json_if_changed("qa_cache", new_cache)
     if return_detail:
         return {
             "ok": not had_error,
@@ -422,7 +422,7 @@ async def run_day_before_reminder_job(env, state, return_detail: bool = False):
             failed_event_ids.append(event_id)
 
     if cache_changed and state.enabled():
-        await state.put_json("reminder_cache", cache)
+        await state.put_json_if_changed("reminder_cache", cache)
     if return_detail:
         return {
             "ok": not had_error,

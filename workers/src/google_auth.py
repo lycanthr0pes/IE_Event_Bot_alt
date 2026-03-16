@@ -124,9 +124,9 @@ async def _save_cached_token(state, token: str, expires_at: float | None):
     """
     if not state.enabled():
         return
-    await state.put_text("google:access_token", token)
+    await state.put_text_if_changed("google:access_token", token)
     if expires_at is not None and expires_at > 0:
-        await state.put_text("google:expires_at", str(expires_at))
+        await state.put_text_if_changed("google:expires_at", str(expires_at))
 
 
 async def _fetch_token_from_broker(env, state):

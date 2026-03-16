@@ -62,3 +62,7 @@ artifacts/
 workers/service-account.json
 workers/README_OPERATIONS.md
 workers/README_KV.md
+docs/do-kv-design.md
+docs/KV.md
+docs/Operations.md
+docs/Event_Bot仕様書.md

@@ -876,7 +876,7 @@ async def apply_google_events(env, state, events: list[dict]):
     if state.enabled():
         await state.set_gcal_discord_map(gcal_discord_map)
         await state.set_gcal_notion_map(gcal_notion_map)
-        await state.put_json(queue_key, next_queue)
+        await state.put_json_if_changed(queue_key, next_queue)
 
     return {
         "ok": not had_error,

@@ -27,6 +27,12 @@ Google Calendar webhook と cron を入口にして、差分同期、通知、wa
 
 主要実装は `workers/` 配下です。
 
+高頻度で更新される状態の扱い:
+
+- `sync:last_epoch` と Google webhook 重複抑止は Durable Object (`SyncCoordinator`) 側で保持
+- KV はカーソル、マッピング、キャッシュ、診断結果などの比較的低頻度な状態を保持
+- KV へは「値が変わった時だけ」書き込む設計を基本とし、`result:*` は同一内容なら一定時間再保存しない
+
 - エントリポイント: `workers/src/entry.py`
 - 状態管理 (KV): `workers/src/state.py`
 - 排他ロック (Durable Object): `workers/src/sync_lock_do.py`
@@ -95,6 +101,8 @@ Google Calendar webhook と cron を入口にして、差分同期、通知、wa
 - cron: `*/5 * * * *` (5分)
 - `KV_SYNC_COOLDOWN_ENABLED=true`
 - `KV_GCAL_DEDUPE_ENABLED=true`
+- `KV_RESULT_MIN_WRITE_SECONDS=3600`
+- `GCAL_DEDUPE_TTL_SECONDS=86400`
 - `SYNC_DO_LOCK_ENABLED=true`
 - `SYNC_DO_LOCK_TTL_SECONDS=120`
 - `GOOGLE_APPLY_MAX_EVENTS_PER_RUN=5`
@@ -153,8 +161,10 @@ Google 認証ソースの優先順:
 - `WORKER_HYBRID_INCLUDE_DISCORD_NOTION`: `hybrid` 時に Discord->Notion 同期を含めるか
 - `WORKER_HYBRID_APPLY_GOOGLE_EVENTS`: `hybrid` 時に Google 差分を Notion/Discord へ反映するか
 - `SYNC_INTERVAL_SECONDS`: 連続同期の最小間隔（秒）
-- `KV_SYNC_COOLDOWN_ENABLED`: KV ベースのクールダウンスキップを有効化
-- `KV_GCAL_DEDUPE_ENABLED`: webhook 重複通知抑止（`gcal_msg:*`）を有効化
+- `KV_SYNC_COOLDOWN_ENABLED`: クールダウンスキップを有効化（実体は `SyncCoordinator` を優先利用）
+- `KV_GCAL_DEDUPE_ENABLED`: webhook 重複通知抑止を有効化（実体は `SyncCoordinator` を優先利用）
+- `KV_RESULT_MIN_WRITE_SECONDS`: `result:*` に同一内容を再保存する最小間隔（秒）
+- `GCAL_DEDUPE_TTL_SECONDS`: Google webhook 重複抑止レコードの保持秒数
 - `SYNC_DO_LOCK_ENABLED`: Durable Object ロックによる同時実行抑止を有効化
 - `SYNC_DO_LOCK_TTL_SECONDS`: ロック有効時間（秒）
 

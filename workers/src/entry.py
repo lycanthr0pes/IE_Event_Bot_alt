@@ -292,7 +292,7 @@ class Default(WorkerEntrypoint):
             watch_result = await ensure_watch_active(self.env, StateStore(self.env))
             watch_result["path"] = "/admin/gcal/watch/ensure"
             results.append(watch_result)
-            if StateStore(self.env).enabled():
+            if StateStore(self.env).enabled() and str(watch_result.get("action") or "") != "noop_valid":
                 await StateStore(self.env).set_last_result("gcal_watch_ensure", watch_result)
         elif run_watch_renew:
             watch_result = await renew_watch(self.env, StateStore(self.env))

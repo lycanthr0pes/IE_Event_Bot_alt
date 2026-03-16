@@ -822,7 +822,7 @@ async def run_discord_notion_poll_sync(env, state):
     if state.enabled():
         # 次回差分計算の基準を更新する。
         await state.set_discord_snapshot(current_snapshot)
-        await state.put_json(queue_key, retry_ops + remaining_ops)
+        await state.put_json_if_changed(queue_key, retry_ops + remaining_ops)
 
     return {
         "ok": not had_error,

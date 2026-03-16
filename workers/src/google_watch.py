@@ -127,7 +127,7 @@ async def register_watch(env, state):
     }
     # watch保存
     if state.enabled():
-        await state.put_json("gcal_watch_state", state_payload)
+        await state.put_json_if_changed("gcal_watch_state", state_payload)
     return {"ok": True, "watch_state": state_payload}
 
 
