@@ -66,3 +66,4 @@ docs/do-kv-design.md
 docs/KV.md
 docs/Operations.md
 docs/Event_Bot仕様書.md
+tools/utf8-no-bom.ps1
