@@ -31,7 +31,7 @@ Google Calendar webhook と cron を入口にして、差分同期、通知、wa
 
 - `sync:last_epoch` と Google webhook 重複抑止は Durable Object (`SyncCoordinator`) 側で保持
 - KV はカーソル、マッピング、キャッシュ、診断結果などの比較的低頻度な状態を保持
-- KV へは「値が変わった時だけ」書き込む設計を基本とし、`result:*` は同一内容なら一定時間再保存しない
+- KV へは「値が変わった時だけ」書き込む設計を基本とし、同一内容なら一定時間再保存しない
 
 - エントリポイント: `workers/src/entry.py`
 - 状態管理 (KV): `workers/src/state.py`
@@ -184,9 +184,9 @@ Google 認証ソースの優先順:
 ### 7.5 Discord 同期制御
 - `DISCORD_TO_GOOGLE_SYNC_ENABLED`: Discord 変更を Google に反映する経路を有効化
 - `DISCORD_SYNC_ENABLED`: Google->Discord 反映自体の有効/無効
-- `DISCORD_APPEND_GCAL_MARKER`: Discord description に gcal-id マーカーを追記するか
+- `DISCORD_APPEND_GCAL_MARKER`: Discord イベント本文に gcal-id マーカーを追記するか
 - `DISCORD_ORIGIN_MARKER_PREFIX`: マーカー接頭辞（例: `[gcal-id:`）
-- `DISCORD_DESCRIPTION_LIMIT`: Discord description の最大文字数
+- `DISCORD_DESCRIPTION_LIMIT`: Discord イベント本文の最大文字数
 - `DISCORD_NAME_LIMIT`: イベント名の最大文字数
 - `DISCORD_LOCATION_LIMIT`: 場所の最大文字数
 - `DISCORD_LOCATION_FALLBACK`: 場所が空のときの代替文字列
@@ -268,23 +268,7 @@ curl -sS -X POST -H "Authorization: Bearer $TOKEN" \
   "$BASE_URL/admin/gcal/watch/register"
 ```
 
-## 10. KV と状態データ
-
-KV のキー設計と詳細は以下を参照してください。
-
-- `workers/README_KV.md`
-
-主なキー:
-- `sync:updated_min`, `sync:last_epoch`
-- `gcal_msg:*`（webhook 重複抑止）
-- `map:gcal_discord`, `map:gcal_notion`
-- `discord:snapshot`
-- `google:access_token`, `google:expires_at`
-- `gcal_watch_state`
-- `qa_cache`, `reminder_cache`, `cleanup:last_epoch`
-- `result:*`
-
-## 11. トラブルシュートの入口
+## 10. トラブルシュートの入口
 
 - `/sync/all` が `cooldown_skip`: `SYNC_INTERVAL_SECONDS` と `sync:last_epoch` を確認
 - `/sync/all` が `in_progress_skip`: `sync_lock` と `SYNC_DO_LOCK_TTL_SECONDS` を確認
@@ -293,7 +277,7 @@ KV のキー設計と詳細は以下を参照してください。
 - キュー滞留: `sync:google_apply_queue` と `sync:discord_notion_queue` を確認
 - 疎通切り分け: `/admin/migration-status?include_checks=1`
 
-## 12. 開発メモ
+## 11. 開発メモ
 
 - Python package metadata: `pyproject.toml`
 - 開発依存: `ruff`, `pytest`
