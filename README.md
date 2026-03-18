@@ -1,6 +1,6 @@
 # IE Event Bot
 
-Discord / Google Calendar / Notion のイベント情報を同期する Cloudflare Workers (Python) プロジェクトです。  
+Discord / Google カレンダー / Notion のイベント情報を同期する Cloudflare Workers (Python) プロジェクトです。  
 Google Calendar webhook と cron を入口にして、差分同期、通知、watch 維持、定期メンテナンスを Worker 側で実行します。
 
 ## 1. 機能
