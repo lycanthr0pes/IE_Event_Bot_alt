@@ -9,7 +9,7 @@ from discord_notion_sync import run_discord_notion_poll_sync
 from google_auth import describe_google_auth_sources, set_google_access_token
 from google_apply_sync import apply_google_events
 from google_calendar_sync import run_google_delta_fetch
-from google_watch import ensure_watch_active, register_watch, renew_watch
+from google_watch import ensure_watch_active
 from health_checks import run_connectivity_checks
 from jobs import run_auto_clean_job, run_day_before_reminder_job, run_qa_notification_job
 from state import StateStore
@@ -101,22 +101,13 @@ class Default(WorkerEntrypoint):
             ok = await set_google_access_token(state, token, expires_in)
             return _json_response({"ok": ok}, status=200 if ok else 400)
         
-        # Google Calendar watch を新規登録
-        if path == "/admin/gcal/watch/register":
+        # Google Calendar watch を ensure する
+        if path == "/admin/gcal/watch/ensure":
             if not self._authorized(request):
                 return Response("unauthorized", status=401)
-            result = await register_watch(self.env, state)
-            if state.enabled():
-                await state.set_last_result("gcal_watch_register", result)
-            return _json_response(result, status=200 if result.get("ok") else 500)
-
-        # 既存 watch を止めて再登録
-        if path == "/admin/gcal/watch/renew":
-            if not self._authorized(request):
-                return Response("unauthorized", status=401)
-            result = await renew_watch(self.env, state)
-            if state.enabled():
-                await state.set_last_result("gcal_watch_renew", result)
+            result = await ensure_watch_active(self.env, state)
+            if state.enabled() and str(result.get("action") or "") != "noop_valid":
+                await state.set_last_result("gcal_watch_ensure", result)
             return _json_response(result, status=200 if result.get("ok") else 500)
 
         # 移行状況・システム状態の確認API
@@ -248,11 +239,6 @@ class Default(WorkerEntrypoint):
             getattr(self.env, "CRON_ENABLE_DISCORD_NOTION_SYNC", "false"),
             default=False,
         )
-        # Google Calendar watch の renew をするかどうか
-        run_watch_renew = _bool_env(
-            getattr(self.env, "CRON_ENABLE_GCAL_WATCH_RENEW", "false"),
-            default=False,
-        )
         # Google Calendar watch の ensure をするかどうか
         run_watch_ensure = _bool_env(
             getattr(self.env, "CRON_ENABLE_GCAL_WATCH_ENSURE", "false"),
@@ -294,12 +280,6 @@ class Default(WorkerEntrypoint):
             results.append(watch_result)
             if StateStore(self.env).enabled() and str(watch_result.get("action") or "") != "noop_valid":
                 await StateStore(self.env).set_last_result("gcal_watch_ensure", watch_result)
-        elif run_watch_renew:
-            watch_result = await renew_watch(self.env, StateStore(self.env))
-            watch_result["path"] = "/admin/gcal/watch/renew"
-            results.append(watch_result)
-            if StateStore(self.env).enabled():
-                await StateStore(self.env).set_last_result("gcal_watch_renew", watch_result)
         if run_qa:
             qa_detail = await run_qa_notification_job(
                 self.env,
@@ -401,75 +381,61 @@ class Default(WorkerEntrypoint):
                     status=200,
                 )
             lock_owner = acquired.get("owner")
-        mode = self._sync_all_mode()
         try:
-            """
-            native : 必ずapplyする
-            hybrid : 設定次第でapplyする
-            """
-            if mode in ("hybrid", "native"):
-                # Google 差分取得
-                google_result = await run_google_delta_fetch(self.env, state, commit_cursor=False)
-                apply_result = {"ok": True, "skipped": True}
-                # Google差分を実際に Notion / Discord へ反映するか
-                should_apply_google = self._hybrid_apply_google_events() or mode == "native"
-                if google_result.get("ok") and should_apply_google:
-                    apply_result = await apply_google_events(
-                        self.env,
-                        state,
-                        google_result.get("items") or [],
-                    )
-                """ 
-                - Google差分取得成功
-                - Google apply 成功
-                - state 利用可能
-                この3つがそろったときだけ、次回カーソルを保存する。
-                """
-                if google_result.get("ok") and apply_result.get("ok") and state.enabled():
-                    next_cursor = str(google_result.get("next_updated_min") or "")
-                    if next_cursor:
-                        await state.set_sync_updated_min(next_cursor)
-                discord_result = {"ok": True, "skipped": True}
-                # Discord 同期を実行するか判定
-                should_include_discord = (
-                    self._sync_all_include_discord_notion()
-                    and (self._hybrid_include_discord_notion() or mode == "native")
+            mode = self._sync_all_mode()
+            # Google 差分取得
+            google_result = await run_google_delta_fetch(self.env, state, commit_cursor=False)
+            apply_result = {"ok": True, "skipped": True}
+            if google_result.get("ok"):
+                apply_result = await apply_google_events(
+                    self.env,
+                    state,
+                    google_result.get("items") or [],
                 )
-                if should_include_discord:
-                    discord_result = await run_discord_notion_poll_sync(self.env, state)
-                # 全体成功判定
-                ok = (
-                    bool(google_result.get("ok"))
-                    and bool(apply_result.get("ok"))
-                    and bool(discord_result.get("ok"))
-                )
-                # 成功時に最終同期時刻を保存
-                if ok and state.enabled():
-                    await state.set_sync_last_epoch_now()
-                if state.enabled():
-                    await state.set_last_result(
-                        "sync_all",
-                        {
-                            "ok": ok,
-                            "mode": mode,
-                            "google_ok": bool(google_result.get("ok")),
-                            "google_apply_ok": bool(apply_result.get("ok")),
-                            "discord_notion_ok": bool(discord_result.get("ok")),
-                        },
-                    )
-                return _json_response(
+            """
+            - Google差分取得成功
+            - Google apply 成功
+            - state 利用可能
+            この3つがそろったときだけ、次回カーソルを保存する。
+            """
+            if google_result.get("ok") and apply_result.get("ok") and state.enabled():
+                next_cursor = str(google_result.get("next_updated_min") or "")
+                if next_cursor:
+                    await state.set_sync_updated_min(next_cursor)
+            discord_result = {"ok": True, "skipped": True}
+            if self._sync_all_include_discord_notion():
+                discord_result = await run_discord_notion_poll_sync(self.env, state)
+            # 全体成功判定
+            ok = (
+                bool(google_result.get("ok"))
+                and bool(apply_result.get("ok"))
+                and bool(discord_result.get("ok"))
+            )
+            # 成功時に最終同期時刻を保存
+            if ok and state.enabled():
+                await state.set_sync_last_epoch_now()
+            if state.enabled():
+                await state.set_last_result(
+                    "sync_all",
                     {
                         "ok": ok,
                         "mode": mode,
-                        "source": source,
-                        "google": google_result,
-                        "google_apply": apply_result,
-                        "discord_notion": discord_result,
+                        "google_ok": bool(google_result.get("ok")),
+                        "google_apply_ok": bool(apply_result.get("ok")),
+                        "discord_notion_ok": bool(discord_result.get("ok")),
                     },
-                    status=200 if ok else 500,
                 )
-            # mode が "hybrid" でも "native" でもないなら、設定異常として 500 を返す
-            return _json_response({"ok": False, "error": "invalid_sync_all_mode", "mode": mode}, status=500)
+            return _json_response(
+                {
+                    "ok": ok,
+                    "mode": mode,
+                    "source": source,
+                    "google": google_result,
+                    "google_apply": apply_result,
+                    "discord_notion": discord_result,
+                },
+                status=200 if ok else 500,
+            )
         # ロック解除
         finally:
             if lock_owner:
@@ -484,28 +450,13 @@ class Default(WorkerEntrypoint):
             return 300.0
 
     def _sync_all_mode(self) -> str:
-        """同期モード（native/hybrid）を正規化して返す。"""
-        mode = str(getattr(self.env, "WORKER_SYNC_ALL_MODE", "native") or "native").strip().lower()
-        return mode if mode in ("hybrid", "native") else "native"
-
-    def _hybrid_include_discord_notion(self) -> bool:
-        """hybrid 時に Discord->Notion 同期を含めるか。"""
-        return _bool_env(
-            getattr(self.env, "WORKER_HYBRID_INCLUDE_DISCORD_NOTION", "true"),
-            default=True,
-        )
+        """同期モード名を返す。現行実装は native 固定。"""
+        return "native"
 
     def _sync_all_include_discord_notion(self) -> bool:
         """/sync/all で Discord->Notion を実行するか。"""
         return _bool_env(
             getattr(self.env, "SYNC_ALL_INCLUDE_DISCORD_NOTION", "false"),
-            default=False,
-        )
-
-    def _hybrid_apply_google_events(self) -> bool:
-        """hybrid 時に Google 差分の apply を行うか。"""
-        return _bool_env(
-            getattr(self.env, "WORKER_HYBRID_APPLY_GOOGLE_EVENTS", "false"),
             default=False,
         )
 
@@ -616,8 +567,6 @@ class Default(WorkerEntrypoint):
                 "job_reminder",
                 "job_cleanup",
                 "job_run_all",
-                "gcal_watch_register",
-                "gcal_watch_renew",
                 "gcal_watch_ensure",
             ):
                 last_results[key] = await state.get_last_result(key)
@@ -627,8 +576,6 @@ class Default(WorkerEntrypoint):
             "kv_enabled": state.enabled(),
             "features": {
                 "sync_all_include_discord_notion": self._sync_all_include_discord_notion(),
-                "hybrid_include_discord_notion": self._hybrid_include_discord_notion(),
-                "hybrid_apply_google_events": self._hybrid_apply_google_events(),
             },
             "required_envs": {
                 "notion_token": bool(getattr(self.env, "NOTION_TOKEN", None)),
