@@ -5,6 +5,7 @@
 	"compatibility_flags": [
 		"python_workers"
 	],
+	"account_id": "41e02dd6c698acfc2f8aae183474bde2",
 	"durable_objects": {
 		"bindings": [
 			{
