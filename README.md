@@ -162,6 +162,7 @@ Google 認証ソースの優先順:
 - `GCAL_WATCH_RENEW_THRESHOLD_SECONDS`: watch 残り期限がこの秒数未満なら renew
 - `WATCH_CHANNEL_ID`: Google watch 登録時の channel ID（未指定時は自動生成）
 - `CLEANUP_INTERVAL_SECONDS`: cleanup ジョブの最小実行間隔
+  - 外部DBはイベント終了日から30日後にアーカイブ、内部DBはイベント終了時点でアーカイブ
 - `REMINDER_WINDOW_MINUTES`: 「24時間後」から何分幅で通知対象にするか
 
 ### 7.5 Discord 同期制御

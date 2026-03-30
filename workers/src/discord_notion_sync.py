@@ -183,6 +183,30 @@ def _fingerprint(event: dict):
     return json.dumps(normalized, sort_keys=True, ensure_ascii=False)
 
 
+def _snapshot_status(snapshot_value) -> str:
+    """
+    保存済みスナップショット文字列から Discord event status を取り出す。
+    読み取れない場合は空文字を返す。
+    """
+    if not snapshot_value:
+        return ""
+    try:
+        data = json.loads(str(snapshot_value))
+    except Exception:
+        return ""
+    return str((data or {}).get("status") or "").strip()
+
+
+def _should_treat_missing_event_as_delete(snapshot_value) -> bool:
+    """
+    前回スナップショットにしか存在しないイベントを削除扱いにするか判定する。
+    Discord の完了イベントは一覧取得から外れることがあるため、
+    completed 相当の status は delete と見なさない。
+    """
+    status = _snapshot_status(snapshot_value)
+    return status not in ("3", "completed", "COMPLETED")
+
+
 async def _discord_api_request(env, method: str, path: str, payload=None):
     """
     Discord REST API の共通ラッパー。
@@ -740,7 +764,12 @@ async def run_discord_notion_poll_sync(env, state):
 
     # スナップショット比較
     created_ids = [eid for eid in current_snapshot.keys() if eid not in previous_snapshot]
-    deleted_ids = [eid for eid in previous_snapshot.keys() if eid not in current_snapshot]
+    deleted_ids = [
+        eid
+        for eid in previous_snapshot.keys()
+        if eid not in current_snapshot
+        and _should_treat_missing_event_as_delete(previous_snapshot.get(eid))
+    ]
     updated_ids = [
         eid
         for eid in current_snapshot.keys()

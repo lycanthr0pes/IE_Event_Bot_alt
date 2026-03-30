@@ -457,16 +457,16 @@ async def _notion_archive_page(env, page_id: str) -> bool:
 def _archive_external_due(date_obj, now_utc: datetime) -> bool:
     """
     外部DBのアーカイブ判定。
-    start 日付が「今日から30日以上前」なら true。
+    end（なければ start）日付が「今日から30日以上前」なら true。
     """
     if not isinstance(date_obj, dict):
         return False
-    start = _parse_rfc3339(date_obj.get("start"))
-    if not start:
+    ended_at = _parse_rfc3339(date_obj.get("end") or date_obj.get("start"))
+    if not ended_at:
         return False
-    if start.tzinfo is None:
-        start = start.replace(tzinfo=timezone.utc)
-    age = now_utc.date() - start.astimezone(timezone.utc).date()
+    if ended_at.tzinfo is None:
+        ended_at = ended_at.replace(tzinfo=timezone.utc)
+    age = now_utc.date() - ended_at.astimezone(timezone.utc).date()
     return age.days >= 30
 
 
