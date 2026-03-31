@@ -61,6 +61,32 @@ def _parse_rfc3339(value: str | None):
         return None
 
 
+def _event_location(event: dict):
+    """Discord イベントから location を抽出する。"""
+    metadata = (event or {}).get("entity_metadata") or {}
+    location = metadata.get("location")
+    if not location:
+        return None
+    text = str(location).strip()
+    return text or None
+
+
+def _format_japanese_datetime(dt) -> str | None:
+    """日時を `YYYY年M月D日 曜日 HH:MM` 形式へ整形する。"""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    jst = timezone(timedelta(hours=9))
+    local_dt = dt.astimezone(jst)
+    weekdays = ["月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日", "日曜日"]
+    weekday = weekdays[local_dt.weekday()]
+    return (
+        f"{local_dt.year}年{local_dt.month}月{local_dt.day}日 "
+        f"{weekday} {local_dt.strftime('%H:%M')}"
+    )
+
+
 def _extract_rich_text(page: dict, prop_name: str):
     """Notion page の rich_text プロパティ先頭を文字列化して返す。"""
     props = (page or {}).get("properties", {}) or {}
@@ -401,9 +427,15 @@ async def run_day_before_reminder_job(env, state, return_detail: bool = False):
             continue
 
         event_url = _discord_event_url(env, event_id) or ""
+        event_name = str((event or {}).get("name") or "(タイトルなし)").strip() or "(タイトルなし)"
+        location = _event_location(event) or "(場所未設定)"
+        start_text = _format_japanese_datetime(start_dt) or str((event or {}).get("scheduled_start_time") or "")
         msg = (
             f"<@&{role_id}>\n"
             "🔔 明日開催のイベントがあります\n"
+            f"イベント名: {event_name}\n"
+            f"開始日時: {start_text}\n"
+            f"場所: {location}\n"
             f"{event_url}"
         )
         # Discord REST API メッセージ送信リクエスト

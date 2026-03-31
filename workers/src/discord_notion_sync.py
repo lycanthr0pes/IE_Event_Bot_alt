@@ -125,6 +125,18 @@ def _parse_discord_event_times(event: dict):
     return start_dt, end_dt
 
 
+def _discord_unix_timestamp(dt) -> int | None:
+    """Discord メッセージ用の Unix timestamp を返す。"""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    try:
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
 def _date_prop_from_datetimes(start_dt, end_dt):
     """
     datetime を Notion date プロパティ形式へ変換する。
@@ -269,6 +281,33 @@ async def _list_discord_scheduled_events(env):
             return None, f"discord_list_failed:{status}"
         return None, "discord_list_invalid_response"
     return result, None
+
+
+async def _discord_send_message(env, channel_id: str, content: str) -> str | None:
+    """Discord チャンネルへ通常メッセージを投稿し、message_id を返す。"""
+    if not channel_id or not content:
+        return None
+    result, _status = await _discord_api_request(
+        env,
+        "POST",
+        f"/channels/{channel_id}/messages",
+        payload={"content": content},
+    )
+    message_id = str((result or {}).get("id") or "").strip()
+    return message_id or None
+
+
+async def _discord_add_reaction(env, channel_id: str, message_id: str, emoji: str) -> bool:
+    """Discord メッセージへリアクションを追加する。"""
+    if not channel_id or not message_id or not emoji:
+        return False
+    encoded_emoji = quote(str(emoji), safe="")
+    result, status = await _discord_api_request(
+        env,
+        "PUT",
+        f"/channels/{channel_id}/messages/{message_id}/reactions/{encoded_emoji}/@me",
+    )
+    return result is not None or int(status or 0) == 204
 
 
 async def _notion_query_by_message_id(env, db_id: str, message_id: str):
@@ -465,6 +504,46 @@ def _discord_event_url(env, event_id: str):
     if not guild_id or not event_id:
         return None
     return f"https://discord.com/events/{guild_id}/{event_id}"
+
+
+def _build_event_created_message(env, event: dict) -> str | None:
+    """新規作成イベントの通知メッセージ本文を組み立てる。"""
+    event_id = str((event or {}).get("id") or "").strip()
+    if not event_id:
+        return None
+    name = str((event or {}).get("name") or "(タイトルなし)").strip() or "(タイトルなし)"
+    start_dt, _end_dt = _parse_discord_event_times(event)
+    lines = [
+        "📢 新しいイベントが作成されました",
+        "参加者は✅リアクションで参加表明してください",
+        "",
+        f"イベント名: {name}",
+    ]
+    start_unix = _discord_unix_timestamp(start_dt)
+    if start_unix is not None:
+        lines.append(f"開始日時: <t:{start_unix}:F>")
+    location = str(_event_location(event) or "").strip()
+    if location:
+        lines.append(f"場所: {location}")
+    event_url = _discord_event_url(env, event_id)
+    if event_url:
+        lines.append(event_url)
+    return "\n".join(lines)
+
+
+async def _notify_discord_event_created(env, event: dict) -> bool:
+    """新規作成された Discord イベントを通知チャンネルへ投稿する。"""
+    channel_id = _env_text(env, "EVENT_CREATE_CHANNEL_ID", "")
+    if not channel_id:
+        return False
+    message = _build_event_created_message(env, event)
+    if not message:
+        return False
+    message_id = await _discord_send_message(env, channel_id, message)
+    if not message_id:
+        return False
+    # 参加表明用の✅リアクションを付与する
+    return await _discord_add_reaction(env, channel_id, message_id, "✅")
 
 
 def _google_sync_enabled(env) -> bool:
@@ -838,6 +917,11 @@ async def run_discord_notion_poll_sync(env, state):
                 had_error = True
                 errors.append(f"upsert_failed:{event_id}")
                 retry_ops.append({"op": "upsert", "id": event_id})
+            elif event_id in created_ids:
+                notified = await _notify_discord_event_created(env, event)
+                if not notified and _env_text(env, "EVENT_CREATE_CHANNEL_ID", ""):
+                    had_error = True
+                    errors.append(f"create_notify_failed:{event_id}")
         # 削除
         else:
             ok = await _sync_discord_event_delete(env, event_id, google_token)

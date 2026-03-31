@@ -193,6 +193,7 @@ Google 認証ソースの優先順:
 ### 7.7 Q&A / リマインド
 - `NOTION_QA_ID`: Q&A 通知対象の Notion DB ID
 - `QA_CHANNEL_ID`: 未回答更新を通知する Discord チャンネル ID
+- `EVENT_CREATE_CHANNEL_ID`: Discord で新規イベント作成が観測されたときに通知するチャンネル ID
 - `REMINDER_CHANNEL_ID`: 前日リマインド送信先チャンネル ID
 - `REMINDER_ROLE_ID`: リマインド時にメンションするロール ID
 
