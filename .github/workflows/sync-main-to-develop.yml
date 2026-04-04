@@ -45,4 +45,3 @@ jobs:
             --head "$BR" \
             --title "chore(sync): main -> develop (${TAG})" \
             --body "Automated sync after release ${TAG}."
-

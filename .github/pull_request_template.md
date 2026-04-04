@@ -24,4 +24,3 @@
 - [ ] CI passed
 - [ ] I tested the change locally
 - [ ] No secrets are included
-

@@ -29,4 +29,3 @@ git push origin develop
 3. Merge PR. Release Please opens a release PR.
 4. Merge release PR to create tag `vX.Y.Z` and GitHub Release.
 5. Auto sync PR `main -> develop` is created by workflow.
-
