@@ -15,33 +15,25 @@ jobs:
           echo "HEAD=$HEAD"
           echo "BASE=$BASE"
 
-          if [[ "$HEAD" == feature/* ]]; then
-            if [[ "$BASE" != "develop" ]]; then
-              echo "::error::feature/* PR must target develop (got $BASE)"
+          case "$HEAD" in
+            feature/*)
+              EXPECTED_BASE="develop"
+              ;;
+            release/*|hotfix/*)
+              EXPECTED_BASE="main"
+              ;;
+            sync/*)
+              EXPECTED_BASE="develop"
+              ;;
+            *)
+              echo "::error::Unsupported head branch '$HEAD'. Allowed prefixes: feature/*, release/*, hotfix/*, sync/*"
               exit 1
-            fi
-          fi
+              ;;
+          esac
 
-          if [[ "$HEAD" == release/* ]]; then
-            if [[ "$BASE" != "main" ]]; then
-              echo "::error::release/* PR must target main (got $BASE)"
-              exit 1
-            fi
-          fi
-
-          if [[ "$HEAD" == hotfix/* ]]; then
-            if [[ "$BASE" != "main" ]]; then
-              echo "::error::hotfix/* PR must target main (got $BASE)"
-              exit 1
-            fi
-          fi
-
-          if [[ "$HEAD" == sync/* ]]; then
-            if [[ "$BASE" != "develop" ]]; then
-              echo "::error::sync/* PR must target develop (got $BASE)"
-              exit 1
-            fi
+          if [[ "$BASE" != "$EXPECTED_BASE" ]]; then
+            echo "::error::$HEAD PR must target $EXPECTED_BASE (got $BASE)"
+            exit 1
           fi
 
           echo "OK"
-

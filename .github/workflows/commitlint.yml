@@ -15,10 +15,14 @@ jobs:
         with:
           node-version: 20
       - run: npm i -g @commitlint/cli @commitlint/config-conventional
+      - name: Lint PR title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          printf '%s\n' "$PR_TITLE" | commitlint --extends @commitlint/config-conventional
       - name: Lint commits in PR
         run: |
-          npx commitlint \
+          commitlint \
             --from "${{ github.event.pull_request.base.sha }}" \
             --to   "${{ github.event.pull_request.head.sha }}" \
             --extends @commitlint/config-conventional
-
