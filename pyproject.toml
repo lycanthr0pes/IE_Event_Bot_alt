@@ -13,3 +13,6 @@ dev = [
   "ruff",
   "pytest",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+"workers/src/entry.py" = ["F401"]

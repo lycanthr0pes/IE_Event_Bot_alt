@@ -1,7 +1,6 @@
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, TYPE_CHECKING
-from urllib.parse import quote
 
 try:
     from workers import fetch as _runtime_fetch
