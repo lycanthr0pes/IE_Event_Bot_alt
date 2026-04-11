@@ -283,15 +283,18 @@ async def _list_discord_scheduled_events(env):
     return result, None
 
 
-async def _discord_send_message(env, channel_id: str, content: str) -> str | None:
+async def _discord_send_message(env, channel_id: str, content: str, allowed_mentions=None) -> str | None:
     """Discord チャンネルへ通常メッセージを投稿し、message_id を返す。"""
     if not channel_id or not content:
         return None
+    payload = {"content": content}
+    if allowed_mentions is not None:
+        payload["allowed_mentions"] = allowed_mentions
     result, _status = await _discord_api_request(
         env,
         "POST",
         f"/channels/{channel_id}/messages",
-        payload={"content": content},
+        payload=payload,
     )
     message_id = str((result or {}).get("id") or "").strip()
     return message_id or None
@@ -513,12 +516,18 @@ def _build_event_created_message(env, event: dict) -> str | None:
         return None
     name = str((event or {}).get("name") or "(タイトルなし)").strip() or "(タイトルなし)"
     start_dt, _end_dt = _parse_discord_event_times(event)
-    lines = [
-        "📢 新しいイベントが作成されました",
-        "参加者は✅リアクションで参加表明してください",
-        "",
-        f"イベント名: {name}",
-    ]
+    lines = []
+    role_id = _env_text(env, "EVENT_CREATE_ROLE_ID", "")
+    if role_id:
+        lines.append(f"<@&{role_id}>")
+    lines.extend(
+        [
+            "📢 新しいイベントが作成されました",
+            "参加者は✅リアクションで参加表明してください",
+            "",
+            f"イベント名: {name}",
+        ]
+    )
     start_unix = _discord_unix_timestamp(start_dt)
     if start_unix is not None:
         lines.append(f"開始日時: <t:{start_unix}:F>")
@@ -536,10 +545,19 @@ async def _notify_discord_event_created(env, event: dict) -> bool:
     channel_id = _env_text(env, "EVENT_CREATE_CHANNEL_ID", "")
     if not channel_id:
         return False
+    role_id = _env_text(env, "EVENT_CREATE_ROLE_ID", "")
     message = _build_event_created_message(env, event)
     if not message:
         return False
-    message_id = await _discord_send_message(env, channel_id, message)
+    allowed_mentions = None
+    if role_id:
+        allowed_mentions = {"parse": ["roles"], "users": [], "everyone": False}
+    message_id = await _discord_send_message(
+        env,
+        channel_id,
+        message,
+        allowed_mentions=allowed_mentions,
+    )
     if not message_id:
         return False
     # 参加表明用の✅リアクションを付与する
