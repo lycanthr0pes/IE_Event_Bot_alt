@@ -162,7 +162,7 @@ Google 認証ソースの優先順:
 - `GCAL_WATCH_RENEW_THRESHOLD_SECONDS`: watch 残り期限がこの秒数未満なら renew
 - `WATCH_CHANNEL_ID`: Google watch 登録時の channel ID（未指定時は自動生成）
 - `CLEANUP_INTERVAL_SECONDS`: cleanup ジョブの最小実行間隔
-  - 外部DBはイベント終了日から30日後にアーカイブ、内部DBはイベント終了時点でアーカイブ
+  - 内部DBはイベント終了時点でアーカイブ
 - `REMINDER_WINDOW_MINUTES`: 「24時間後」から何分幅で通知対象にするか
 
 ### 7.5 Discord 同期制御
@@ -194,6 +194,7 @@ Google 認証ソースの優先順:
 - `NOTION_QA_ID`: Q&A 通知対象の Notion DB ID
 - `QA_CHANNEL_ID`: 未回答更新を通知する Discord チャンネル ID
 - `EVENT_CREATE_CHANNEL_ID`: Discord で新規イベント作成が観測されたときに通知するチャンネル ID
+- `EVENT_CREATE_ROLE_ID`: イベント作成通知時にメンションするロール ID
 - `REMINDER_CHANNEL_ID`: 前日リマインド送信先チャンネル ID
 - `REMINDER_ROLE_ID`: リマインド時にメンションするロール ID
 

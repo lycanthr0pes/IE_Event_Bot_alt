@@ -1,11 +1,11 @@
 {
-	"name": "ie-event-bot-workers",
+	"name": "ie-event-bot",
 	"main": "src/entry.py",
 	"compatibility_date": "2026-03-07",
 	"compatibility_flags": [
 		"python_workers"
 	],
-	"account_id": "41e02dd6c698acfc2f8aae183474bde2",
+	"account_id": "19fc1347cce15e26c18cd792616f737c",
 	"durable_objects": {
 		"bindings": [
 			{
@@ -45,18 +45,17 @@
 		"CRON_ENABLE_AUTO_CLEAN": "true",
 		"CLEANUP_INTERVAL_SECONDS": "86400",
 		"DISCORD_TO_GOOGLE_SYNC_ENABLED": "true",
-
-		"GCAL_WEBHOOK_URL": "https://lycanthr0pe.workers.dev/gcal/webhook",
-		"GOOGLE_CALENDAR_ID": "3a68d6d22b29a086c887d15d3cb6b4f3e8c1d92a501cb15a7a3b8d560a6df810@group.calendar.google.com",
-		"NOTION_EVENT_INTERNAL_ID": "2dcdf9285c70807aa54bc419d1f1d139",
-		"DISCORD_GUILD_ID": "1446782542882541649",
-
-		"NOTION_EVENT_ID": "2c1df9285c708080b619fd43686e92e6",
+		"GCAL_WEBHOOK_URL": "https://ichipiro-explorer.workers.dev/gcal/webhook",
+		"GOOGLE_CALENDAR_ID": "5cd80b5ad919185fa351293849bce195f242241a688f7813a66e5412a04e9c8e@group.calendar.google.com",
+		"NOTION_EVENT_INTERNAL_ID": "33ae013eb8eb80ca9b89f69b12433537",
+		"NOTION_EVENT_ID": "33ae013eb8eb80bfb330e44db5f6014c",
 		"NOTION_QA_ID": "58ea988d55a6441e99937afe80283631",
-		"QA_CHANNEL_ID": "1446942444699779183",
-		"EVENT_CREATE_CHANNEL_ID": "1446942444699779183",
-		"REMINDER_CHANNEL_ID": "1446942444699779183",
-		"REMINDER_ROLE_ID": "1471243577354092668",
+		"QA_CHANNEL_ID": "1492395165355348009",
+		"DISCORD_GUILD_ID": "1144418468188397618",
+		"EVENT_CREATE_CHANNEL_ID": "1492395165355348009",
+		"EVENT_CREATE_ROLE_ID": "1144423625693351986",
+		"REMINDER_CHANNEL_ID": "1492395165355348009",
+		"REMINDER_ROLE_ID": "1144423625693351986",
 		"REMINDER_WINDOW_MINUTES": 15
 	},
 	"triggers": {
@@ -67,8 +66,8 @@
 	"kv_namespaces": [
 		{
 			"binding": "STATE_KV",
-			"id": "ede4ebb047b04468835193b1aa3567da",
-			"preview_id": "bfca026d6b79429780512cfc8e6eb296",
+			"id": "bd9e8986858a4fcebab772c30451298a",
+			"preview_id": "3d901e8e0d6a4af38b5584ba10cb6ad0",
 			"remote": true
 		}
 	]
